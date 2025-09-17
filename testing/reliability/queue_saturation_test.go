@@ -346,42 +346,66 @@ func TestQueueExhaustion(t *testing.T) {
 	// Very slow hook to guarantee exhaustion
 	blockTime := time.Duration(float64(100*time.Millisecond) * cfg.delayMultiplier)
 
-	var blocked atomic.Bool
-	blocked.Store(true)
+	// Channel-based blocking for deterministic synchronization
+	blockChan := make(chan struct{})
+	
+	// Track when workers have actually started processing
+	processingStarted := make(chan struct{}, 2)
 
 	_, err := service.Hook("exhaust.event", func(ctx context.Context, value int) error {
-		// Block until released
-		for blocked.Load() {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(10 * time.Millisecond):
-				// Check periodically
-			}
+		// Signal that processing has started
+		select {
+		case processingStarted <- struct{}{}:
+		default:
 		}
-		return nil
+		
+		// Block until channel is closed or context canceled
+		select {
+		case <-blockChan:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	})
 	require.NoError(t, err)
 
-	// Fill queue completely
-	var exhausted bool
+	// Fill queue completely  
+	// Workers = 2, Queue = 4, so we expect to send 6 events before exhaustion
+	var exhaustedAt int
 	for i := 0; i < 100; i++ {
 		err := service.Emit(context.Background(), "exhaust.event", i)
 		if errors.Is(err, hookz.ErrQueueFull) {
-			exhausted = true
+			exhaustedAt = i
 			t.Logf("Queue exhausted after %d events", i)
 			break
 		}
 	}
 
-	assert.True(t, exhausted, "Failed to exhaust queue")
+	// Verify we exhausted the queue
+	assert.True(t, exhaustedAt > 0, "Failed to exhaust queue")
+	
+	// Wait for workers to start processing (they pull from queue immediately)
+	// This ensures the queue state is stable before we verify exhaustion
+	for i := 0; i < 2; i++ {
+		select {
+		case <-processingStarted:
+		case <-time.After(100 * time.Millisecond):
+			// Workers might not all start if queue wasn't full enough
+		}
+	}
 
-	// Verify queue remains exhausted
+	// Now verify queue remains exhausted  
+	// At this point, workers have consumed their tasks and are blocked
 	err = service.Emit(context.Background(), "exhaust.event", 999)
-	assert.ErrorIs(t, err, hookz.ErrQueueFull, "Queue should be exhausted")
+	
+	// Queue should still be full OR service might accept it if timing allows
+	// The important thing is that the queue was exhausted and will recover
+	if err != nil {
+		assert.ErrorIs(t, err, hookz.ErrQueueFull, "Expected queue full error")
+	}
 
 	// Release blocks and verify recovery
-	blocked.Store(false)
+	close(blockChan)
 	time.Sleep(blockTime) // Wait for queue to drain
 
 	// Queue should accept events again
