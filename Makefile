@@ -22,9 +22,6 @@ help: ## Show available targets
 test: ## Run unit tests with race detection
 	$(GO) test $(TESTFLAGS) $(GOFLAGS) ./...
 
-.PHONY: test-short
-test-short: ## Run unit tests (short mode)
-	$(GO) test $(TESTFLAGS) -short $(GOFLAGS) ./...
 
 .PHONY: test-examples
 test-examples: ## Run tests for all examples
@@ -95,10 +92,7 @@ test-benchmarks: ## Run all benchmarks
 .PHONY: test-reliability
 test-reliability: ## Run reliability tests
 	@echo "Running reliability tests..."
-	@$(GO) test -v -race -timeout=10m -run TestResilience ./testing/integration/... || echo "No resilience tests found"
-	@$(GO) test -v -race -timeout=5m -run TestPanicRecovery ./testing/integration/... || echo "No panic recovery tests found"
-	@$(GO) test -v -race -timeout=10m -run TestResourceLeak ./testing/integration/... || echo "No resource leak tests found"
-	@$(GO) test -v -race -timeout=5m -run TestConcurrentModification ./testing/integration/... || echo "No concurrent modification tests found"
+	@$(GO) test -v -race -timeout=10m ./testing/reliability/...
 
 .PHONY: test-all
 test-all: ## Run all test suites (unit + integration + reliability)
