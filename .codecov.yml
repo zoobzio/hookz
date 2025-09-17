@@ -1,0 +1,18 @@
+coverage:
+  precision: 2
+  round: down
+  range: "60...100"
+  
+  status:
+    project:
+      default:
+        target: 80%
+        threshold: 1%
+    patch:
+      default:
+        target: 80%
+
+ignore:
+  - "examples/**/*"
+  - "testing/**/*"
+  - "**/*_test.go"

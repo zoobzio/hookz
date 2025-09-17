@@ -1,0 +1,195 @@
+run:
+  timeout: 5m
+  tests: true
+  build-tags:
+    - integration
+
+linters:
+  enable:
+    # Security-critical linters
+    - gosec        # Comprehensive security analyzer
+    - errcheck     # Unchecked errors
+    - staticcheck  # Advanced static analysis
+    - typecheck    # Type checking
+    - ineffassign  # Detect ineffectual assignments
+    - gofmt        # Formatting
+    - misspell     # Spelling mistakes
+
+linters-settings:
+  gosec:
+    severity: medium
+    confidence: medium
+    excludes:
+      - G104  # We'll use errcheck instead
+    config:
+      global:
+        audit: true
+  
+  govet:
+    enable-all: true
+  
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+    exclude-functions:
+      - (io.Closer).Close  # Handled by bodyclose
+  
+  gocritic:
+    enabled-checks:
+      # Only non-default checks
+      - commentedOutCode
+      - deferInLoop
+      - emptyFallthrough
+      - emptyStringTest
+      - equalFold
+      - evalOrder
+      - exposedSyncMutex
+      - externalErrorReassign
+      - filepathJoin
+      - hexLiteral
+      - httpNoBody
+      - importShadow
+      - indexAlloc
+      - initClause
+      - nestingReduce
+      - nilValReturn
+      - octalLiteral
+      - preferFilepathJoin
+      - preferFprint
+      - preferStringWriter
+      - preferWriteByte
+      - rangeExprCopy
+      - rangeValCopy
+      - redundantSprint
+      - regexpPattern
+      - regexpSimplify
+      - ruleguard
+      - sloppyReassign
+      - sortSlice
+      - sprintfQuotedString
+      - sqlQuery
+      - stringConcatSimplify
+      - stringXbytes
+      - syncMapLoadAndDelete
+      - truncateCmp
+      - typeAssertChain
+      - typeDefFirst
+      - typeUnparen
+      - unlabelStmt
+      - unnamedResult
+      - unnecessaryBlock
+      - unnecessaryDefer
+      - weakCond
+      - yodaStyleExpr
+  
+  revive:
+    severity: warning
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: context-keys-type
+      - name: dot-imports
+      - name: empty-block
+      - name: error-naming
+      - name: error-return
+      - name: error-strings
+      - name: errorf
+      - name: exported
+      - name: if-return
+      - name: increment-decrement
+      - name: indent-error-flow
+      - name: modifies-parameter
+      - name: modifies-value-receiver
+      - name: package-comments
+      - name: range
+      - name: receiver-naming
+      - name: redefines-builtin-id
+      - name: string-of-int
+      - name: superfluous-else
+      - name: time-naming
+      - name: unexported-return
+      - name: unnecessary-stmt
+      - name: unreachable-code
+      - name: unused-parameter
+      - name: unused-receiver
+      - name: useless-break
+      - name: var-declaration
+      - name: var-naming
+  
+  dupl:
+    threshold: 150
+  
+  goconst:
+    min-len: 3
+    min-occurrences: 3
+    
+  misspell:
+    locale: US
+
+issues:
+  exclude-dirs-use-default: false
+  exclude-rules:
+    # Allow TODO comments in development
+    - linters:
+        - godox
+      text: "TODO|FIXME|BUG"
+    
+    # Test files can have longer functions and different struct ordering
+    - path: _test\.go
+      linters:
+        - funlen
+        - goconst
+        - dupl
+        - govet
+        - errcheck
+        - fieldalignment
+        - unused-parameter
+        - godot
+    
+    # Examples can have simpler unused parameter patterns
+    - path: examples/
+      linters:
+        - unused-parameter
+        - fieldalignment
+        - godot
+    
+    # Allow G115 integer conversions for small bounded values in tests
+    - linters:
+        - gosec
+      text: "G115.*integer overflow conversion.*int.*int32"
+    
+    # Allow G115 for safe time.Duration conversions
+    - linters:
+        - gosec
+      text: "G115.*integer overflow conversion.*int.*uint"
+    
+    # Allow G115 for safe memory stat conversions
+    - linters:
+        - gosec
+      text: "G115.*integer overflow conversion.*uint64.*int64"
+    
+    # Allow unused ctx parameters in examples and tests - shows interface compliance
+    - linters:
+        - revive
+      text: "unused-parameter.*ctx.*seems to be unused"
+    
+    # Allow field alignment issues for config structs - readability over memory
+    - linters:
+        - govet
+      text: "fieldalignment.*struct.*pointer bytes"
+    
+    # Allow errorlint in tests - direct comparison is clearer for specific errors
+    - path: _test\.go|examples/
+      linters:
+        - errorlint
+        - gocritic
+        - unused
+  
+  # Maximum issues count per one linter
+  max-issues-per-linter: 0
+  
+  # Maximum count of issues with same text
+  max-same-issues: 0
+  
+  # Show all issues
+  new: false

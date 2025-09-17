@@ -1,0 +1,19 @@
+version: 2
+
+project_name: hookz
+
+builds:
+  - skip: true
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+
+release:
+  github:
+    owner: zoobzio
+    name: hookz

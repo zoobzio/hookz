@@ -1,0 +1,102 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    # Run at 3:17 AM UTC every Monday
+    - cron: '17 3 * * 1'
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'go' ]
+        # CodeQL supports [ 'cpp', 'csharp', 'go', 'java', 'javascript', 'python', 'ruby', 'swift' ]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch all history for all branches and tags
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+        cache: true
+    
+    # Initialize CodeQL tools for scanning
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ matrix.language }}
+        # Specify queries to run
+        queries: +security-extended,security-and-quality
+        # Custom queries can be added here:
+        # queries: ./path/to/custom/queries
+    
+    # Autobuild attempts to build any compiled languages (C/C++, C#, Go, Java, etc.)
+    - name: Autobuild
+      uses: github/codeql-action/autobuild@v3
+    
+    # If autobuild fails, you can manually build your code:
+    # - name: Manual Build
+    #   run: |
+    #     go mod download
+    #     go build -v ./...
+    #     for dir in examples/*/; do
+    #       if [ -f "$dir/go.mod" ]; then
+    #         (cd "$dir" && go build -v ./...)
+    #       fi
+    #     done
+    
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
+      with:
+        category: "/language:${{ matrix.language }}"
+        # Upload SARIF file to GitHub Code Scanning
+        upload: true
+        # Also output to a file for artifact upload
+        output: codeql-results
+    
+    - name: Upload CodeQL results
+      uses: actions/upload-artifact@v4
+      with:
+        name: codeql-results-${{ matrix.language }}
+        path: codeql-results/
+        retention-days: 7
+    
+    # Generate security report summary
+    - name: Security Summary
+      if: always()
+      run: |
+        echo "### CodeQL Security Analysis Complete" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Language:** ${{ matrix.language }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** Analysis completed" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Results will be available in the Security tab of your repository." >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "#### What CodeQL Checks:" >> $GITHUB_STEP_SUMMARY
+        echo "- SQL injection vulnerabilities" >> $GITHUB_STEP_SUMMARY
+        echo "- Path traversal vulnerabilities" >> $GITHUB_STEP_SUMMARY
+        echo "- Cross-site scripting (XSS)" >> $GITHUB_STEP_SUMMARY
+        echo "- Insecure randomness" >> $GITHUB_STEP_SUMMARY
+        echo "- Hard-coded credentials" >> $GITHUB_STEP_SUMMARY
+        echo "- Command injection" >> $GITHUB_STEP_SUMMARY
+        echo "- Race conditions in concurrent code" >> $GITHUB_STEP_SUMMARY
+        echo "- Resource leaks and memory issues" >> $GITHUB_STEP_SUMMARY
+        echo "- And many more security patterns..." >> $GITHUB_STEP_SUMMARY
