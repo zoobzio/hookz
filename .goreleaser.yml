@@ -25,7 +25,6 @@ archives:
       - "LICENSE"
       - "README.md"
       - "Makefile"
-      - "testing/**/*"
       - ".golangci.yml"
     name_template: "{{ .ProjectName }}_{{ .Version }}_source"
 
@@ -114,7 +113,6 @@ release:
     ---
     
     **Full Documentation:** https://github.com/zoobzio/hookz/tree/v{{ .Version }}/README.md
-    **Testing Guide:** https://github.com/zoobzio/hookz/tree/v{{ .Version }}/testing
     
     Thanks to all contributors!
 
