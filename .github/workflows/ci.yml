@@ -37,7 +37,7 @@ jobs:
       run: go mod download
       
     - name: Run unit tests with race detection
-      run: go test -v -race -timeout=5m ./...
+      run: make test
       
 
   # Performance benchmarks - regression detection
@@ -64,12 +64,8 @@ jobs:
     - name: Download dependencies
       run: go mod download
       
-    - name: Run core benchmarks
-      run: cd testing/benchmarks && go mod tidy && go test -v -bench=. -benchmem -benchtime=100ms -timeout=15m
-      
-    - name: Store benchmark results
-      run: |
-        cd testing/benchmarks && go test -bench=. -benchmem -benchtime=100ms -timeout=15m | tee ../../benchmark-results.txt
+    - name: Run and store benchmark results
+      run: make test-benchmarks | tee benchmark-results.txt
         
     - name: Upload benchmark results
       uses: actions/upload-artifact@v4
