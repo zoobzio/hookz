@@ -47,3 +47,11 @@ var ErrQueueFull = errors.New("worker queue is full")
 //
 // These limits prevent memory exhaustion from unlimited hook registration.
 var ErrTooManyHooks = errors.New("hook limit exceeded")
+
+// Hook Execution Errors
+//
+// These errors are returned during hook execution.
+
+// ErrHookPanicked is used internally to track hooks that panicked during execution.
+// This error is not exposed to users but is used for metrics tracking.
+var ErrHookPanicked = errors.New("hook panicked during execution")

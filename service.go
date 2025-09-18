@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zoobzio/clockz"
@@ -144,6 +145,9 @@ type Hooks[T any] struct {
 	GlobalTimeout time.Duration
 	totalHooks    int // Tracks total hook count across all events
 	closed        bool
+
+	// Metrics field - zero initialization provides safe defaults
+	metrics Metrics
 }
 
 // New creates a new hook service with the specified options.
@@ -189,7 +193,7 @@ func New[T any](opts ...Option) *Hooks[T] {
 		totalHooks:    0,
 	}
 
-	impl.workers = newWorkerPoolWithResilience[T](cfg)
+	impl.workers = newWorkerPoolWithResilience[T](cfg, &impl.metrics)
 	return impl
 }
 
@@ -330,6 +334,29 @@ func (h *Hooks[T]) Emit(ctx context.Context, event Key, data T) error {
 	return nil
 }
 
+// Metrics returns current service metrics with thread-safe access.
+// RegisteredHooks requires mutex acquisition for consistency with Hook/Unhook operations.
+// All counter values are read atomically for thread safety.
+func (h *Hooks[T]) Metrics() Metrics {
+	h.mu.RLock()
+	registeredHooks := int64(h.totalHooks)
+	h.mu.RUnlock()
+
+	return Metrics{
+		QueueDepth:      atomic.LoadInt64(&h.metrics.QueueDepth),
+		QueueCapacity:   int64(cap(h.workers.tasks)),
+		TasksProcessed:  atomic.LoadInt64(&h.metrics.TasksProcessed),
+		TasksRejected:   atomic.LoadInt64(&h.metrics.TasksRejected),
+		TasksFailed:     atomic.LoadInt64(&h.metrics.TasksFailed),
+		TasksExpired:    atomic.LoadInt64(&h.metrics.TasksExpired),
+		RegisteredHooks: registeredHooks,
+		// Overflow metrics set to 0 initially, Phase 2 implementation
+		OverflowDepth:    0,
+		OverflowCapacity: 0,
+		OverflowDrained:  0,
+	}
+}
+
 // Close shuts down the service gracefully.
 func (h *Hooks[T]) Close() error {
 	h.mu.Lock()
@@ -342,6 +369,14 @@ func (h *Hooks[T]) Close() error {
 
 	// Shutdown worker pool - this waits for queued hooks to complete
 	h.workers.close()
+
+	// Count remaining tasks as expired for metrics consistency
+	remaining := atomic.LoadInt64(&h.metrics.QueueDepth)
+	if remaining > 0 {
+		atomic.AddInt64(&h.metrics.TasksExpired, remaining)
+		atomic.StoreInt64(&h.metrics.QueueDepth, 0)
+	}
+
 	return nil
 }
 

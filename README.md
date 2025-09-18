@@ -42,6 +42,7 @@ func main() {
 - **Async execution**: `Emit()` returns immediately, hooks run in background
 - **No failures propagate**: Hook errors don't break your business logic
 - **Clean shutdown**: `Close()` waits for completion
+- **Built-in metrics**: Monitor queue depth, throughput, and error rates
 
 ## Installation
 
@@ -72,6 +73,10 @@ func (s *OrderService) CreateOrder(ctx context.Context, order Order) error {
     s.hooks.Emit(ctx, "order.created", order)
     return nil
 }
+
+func (s *OrderService) GetMetrics() hookz.Metrics {
+    return s.hooks.Metrics() // Monitor queue, throughput, errors
+}
 ```
 
 Multiple handlers for the same event:
@@ -101,6 +106,7 @@ hooks.Emit(ctx, "event", data) // Always succeeds if queue not full
 - **Quick Start** - [docs/quickstart.md](docs/quickstart.md) - Get working in 5 minutes
 - **Common Patterns** - [docs/common-patterns.md](docs/common-patterns.md) - Essential usage patterns  
 - **API Reference** - [docs/api-reference.md](docs/api-reference.md) - Complete method documentation
+- **Metrics** - [docs/metrics.md](docs/metrics.md) - Monitoring and observability
 - **Testing** - [docs/testing.md](docs/testing.md) - Testing async hook systems
 - **Performance** - [docs/performance.md](docs/performance.md) - Configuration tuning  
 - **Migration** - [docs/migration.md](docs/migration.md) - Migrate from other patterns

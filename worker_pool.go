@@ -3,6 +3,7 @@ package hookz
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zoobzio/clockz"
@@ -39,6 +40,9 @@ type workerPool[T any] struct {
 
 	// Tracks if the pool has been closed
 	closed bool
+
+	// Metrics pointer for atomic updates
+	metrics *Metrics
 }
 
 // hookTask represents a single hook execution task.
@@ -63,11 +67,12 @@ type hookEntry[T any] struct {
 
 // newWorkerPoolWithResilience creates a worker pool with optional resilience features.
 // Replaces newWorkerPool when backpressure or overflow features are enabled.
-func newWorkerPoolWithResilience[T any](cfg config) *workerPool[T] {
+func newWorkerPoolWithResilience[T any](cfg config, metrics *Metrics) *workerPool[T] {
 	pool := &workerPool[T]{
 		clock:         cfg.clock,
 		tasks:         make(chan hookTask[T], cfg.queueSize),
 		globalTimeout: cfg.timeout,
+		metrics:       metrics,
 	}
 
 	// Configure backpressure
@@ -126,9 +131,12 @@ func (p *workerPool[T]) submitDefault(task hookTask[T]) error {
 	// closed check above and the send operation below, causing panic
 	select {
 	case p.tasks <- task:
+		// Task successfully queued - update depth atomically
+		atomic.AddInt64(&p.metrics.QueueDepth, 1)
 		return nil
 	default:
-		// Queue is full - return error
+		// Queue is full - increment rejection counter
+		atomic.AddInt64(&p.metrics.TasksRejected, 1)
 		return ErrQueueFull
 	}
 }
@@ -139,6 +147,8 @@ func (p *workerPool[T]) submitWithBackpressure(task hookTask[T]) error {
 	// Try immediate submission first
 	select {
 	case p.tasks <- task:
+		// Task successfully queued - update depth atomically
+		atomic.AddInt64(&p.metrics.QueueDepth, 1)
 		return nil
 	default:
 		// Queue definitely full at this point - calculate backpressure
@@ -157,17 +167,24 @@ func (p *workerPool[T]) submitWithBackpressure(task hookTask[T]) error {
 		// Apply backpressure with timeout and context cancellation
 		select {
 		case p.tasks <- task:
+			// Task successfully queued after backpressure - update depth atomically
+			atomic.AddInt64(&p.metrics.QueueDepth, 1)
 			return nil
 		case <-p.clock.After(delay):
 			// Final attempt after backpressure wait
 			select {
 			case p.tasks <- task:
+				// Task successfully queued after wait - update depth atomically
+				atomic.AddInt64(&p.metrics.QueueDepth, 1)
 				return nil
 			default:
+				// Queue still full - increment rejection counter
+				atomic.AddInt64(&p.metrics.TasksRejected, 1)
 				return ErrQueueFull
 			}
 		case <-task.ctx.Done():
-			// Context canceled during backpressure
+			// Context canceled during backpressure - count as expired
+			atomic.AddInt64(&p.metrics.TasksExpired, 1)
 			return task.ctx.Err()
 		}
 	}
@@ -175,8 +192,12 @@ func (p *workerPool[T]) submitWithBackpressure(task hookTask[T]) error {
 	// Below threshold - try one more immediate attempt
 	select {
 	case p.tasks <- task:
+		// Task successfully queued - update depth atomically
+		atomic.AddInt64(&p.metrics.QueueDepth, 1)
 		return nil
 	default:
+		// Queue still full - increment rejection counter
+		atomic.AddInt64(&p.metrics.TasksRejected, 1)
 		return ErrQueueFull
 	}
 }
@@ -212,9 +233,11 @@ func (p *workerPool[T]) submitWithOverflow(task hookTask[T]) error {
 	// Try primary queue first
 	select {
 	case p.tasks <- task:
+		// Task successfully queued - update depth atomically
+		atomic.AddInt64(&p.metrics.QueueDepth, 1)
 		return nil
 	default:
-		// Primary full, try overflow
+		// Primary full, try overflow (metrics tracked in overflow enqueue)
 		return p.overflow.enqueue(task)
 	}
 }
@@ -225,6 +248,8 @@ func (p *workerPool[T]) submitWithBackpressureThenOverflow(task hookTask[T]) err
 	// Phase 1: Try primary queue
 	select {
 	case p.tasks <- task:
+		// Task successfully queued - update depth atomically
+		atomic.AddInt64(&p.metrics.QueueDepth, 1)
 		return nil
 	default:
 		// Primary full, continue to Phase 2
@@ -241,10 +266,14 @@ func (p *workerPool[T]) submitWithBackpressureThenOverflow(task hookTask[T]) err
 
 		select {
 		case p.tasks <- task:
+			// Task successfully queued after backpressure - update depth atomically
+			atomic.AddInt64(&p.metrics.QueueDepth, 1)
 			return nil
 		case <-p.clock.After(delay):
 			// Still full after backpressure, continue to Phase 3
 		case <-task.ctx.Done():
+			// Context canceled during backpressure - count as expired
+			atomic.AddInt64(&p.metrics.TasksExpired, 1)
 			return task.ctx.Err()
 		}
 	}
@@ -285,7 +314,22 @@ func (p *workerPool[T]) worker() {
 	defer p.wg.Done()
 
 	for task := range p.tasks {
-		p.executeHookSafely(task)
+		// Decrement queue depth as soon as task is retrieved
+		atomic.AddInt64(&p.metrics.QueueDepth, -1)
+
+		// Execute hook with panic recovery and metrics tracking
+		// Note: We don't pre-check context cancellation here because the hook
+		// itself is responsible for respecting context cancellation
+		if err := p.executeHookSafely(task); err != nil {
+			// Check if error was due to context cancellation
+			if task.ctx.Err() != nil {
+				atomic.AddInt64(&p.metrics.TasksExpired, 1)
+			} else {
+				atomic.AddInt64(&p.metrics.TasksFailed, 1)
+			}
+		} else {
+			atomic.AddInt64(&p.metrics.TasksProcessed, 1)
+		}
 	}
 }
 
@@ -293,16 +337,19 @@ func (p *workerPool[T]) worker() {
 //
 // This method ensures that panicking hooks cannot crash the entire
 // service. Panics are recovered and handled gracefully.
-func (p *workerPool[T]) executeHookSafely(task hookTask[T]) {
+// Returns error if hook failed or panicked.
+func (p *workerPool[T]) executeHookSafely(task hookTask[T]) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			// Hook panicked - log without crashing the service
+			// Hook panicked - treat as error
 			// In production, this should be reported to error tracking
 			_ = r // Placeholder for panic value handling
+			err = ErrHookPanicked
 		}
 	}()
 
-	p.executeHook(task)
+	err = p.executeHook(task)
+	return err
 }
 
 // executeHook runs the actual hook callback.
@@ -311,7 +358,8 @@ func (p *workerPool[T]) executeHookSafely(task hookTask[T]) {
 //   - Applies global timeout if configured
 //   - Executes the callback function
 //   - Handles context cancellation gracefully
-func (p *workerPool[T]) executeHook(task hookTask[T]) {
+//   - Returns error if hook execution failed
+func (p *workerPool[T]) executeHook(task hookTask[T]) error {
 	ctx := task.ctx
 
 	// Apply global timeout if configured
@@ -321,13 +369,8 @@ func (p *workerPool[T]) executeHook(task hookTask[T]) {
 		defer cancel()
 	}
 
-	// Execute the hook callback
-	if err := task.hook.callback(ctx, task.data); err != nil {
-		// Hook returned error
-		// Errors are not propagated in fire-and-forget execution
-		// In production, this should be reported to error tracking
-		_ = err // Placeholder for error handling
-	}
+	// Execute the hook callback and return any error
+	return task.hook.callback(ctx, task.data)
 }
 
 // overflowQueue provides secondary buffering beyond the primary task queue.
