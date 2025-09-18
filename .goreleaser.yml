@@ -1,19 +1,153 @@
+# GoReleaser configuration for hookz - a Go library for event hook management
+# This configuration is optimized for a library package (no binaries in root)
+
 version: 2
 
+# Set project name
 project_name: hookz
 
+# Output directory
+dist: .dist
+
+# Build configuration
 builds:
+  # Skip building binaries for the main library since it's a library package
   - skip: true
 
+# Archive configuration
+archives:
+  - id: source
+    # Include source files for library distribution
+    files:
+      - "*.go"
+      - "go.mod"
+      - "go.sum"
+      - "LICENSE"
+      - "README.md"
+      - "Makefile"
+      - "testing/**/*"
+      - ".golangci.yml"
+    name_template: "{{ .ProjectName }}_{{ .Version }}_source"
+
+# Checksum configuration
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# Changelog configuration
 changelog:
+  use: github
   sort: asc
+  abbrev: 7
+  groups:
+    - title: "✨ Features"
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: "🐛 Bug Fixes"
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: "⚡ Performance"
+      regexp: '^.*?perf(\([[:word:]]+\))??!?:.+$'
+      order: 2
+    - title: "♻️ Refactoring"
+      regexp: '^.*?refactor(\([[:word:]]+\))??!?:.+$'
+      order: 3
+    - title: "📚 Documentation"
+      regexp: '^.*?docs?(\([[:word:]]+\))??!?:.+$'
+      order: 4
+    - title: "🧪 Testing"
+      regexp: '^.*?test(\([[:word:]]+\))??!?:.+$'
+      order: 5
+    - title: "🔧 Maintenance"
+      regexp: '^.*?chore(\([[:word:]]+\))??!?:.+$'
+      order: 6
+    - title: "🏗️ Build System"
+      regexp: '^.*?build(\([[:word:]]+\))??!?:.+$'
+      order: 7
+    - title: "📦 Dependencies"
+      regexp: '^.*?deps?(\([[:word:]]+\))??!?:.+$'
+      order: 8
+    - title: "Other Changes"
+      order: 999
   filters:
     exclude:
-      - '^docs:'
-      - '^test:'
-      - '^chore:'
+      - "^Merge"
+      - "^merge"
+      - "^wip"
+      - "^WIP"
 
+# Release configuration
 release:
   github:
     owner: zoobzio
     name: hookz
+  
+  # Release name template
+  name_template: "{{ .ProjectName }} v{{ .Version }}"
+  
+  # Draft release initially (can be changed in workflow)
+  draft: false
+  
+  # Mark as prerelease for beta/rc versions
+  prerelease: auto
+  
+  # Release notes mode
+  mode: append
+  
+  # Custom release header
+  header: |
+    ## hookz v{{ .Version }}
+    
+    High-performance event hook management for Go with resilience patterns and zero dependencies.
+    
+    ### Installation
+    
+    ```bash
+    go get github.com/zoobzio/hookz@v{{ .Version }}
+    ```
+    
+    ### Requirements
+    - Go 1.21 or higher
+    
+  # Custom release footer
+  footer: |
+    ---
+    
+    **Full Documentation:** https://github.com/zoobzio/hookz/tree/v{{ .Version }}/README.md
+    **Testing Guide:** https://github.com/zoobzio/hookz/tree/v{{ .Version }}/testing
+    
+    Thanks to all contributors!
+
+# Announce releases (optional)
+announce:
+  skip: true
+  # Uncomment to enable Discord/Slack/Twitter announcements
+  # discord:
+  #   enabled: true
+  #   message_template: "hookz {{ .Tag }} has been released! Check it out at {{ .ReleaseURL }}"
+
+# Snapshot configuration (for testing)
+snapshot:
+  version_template: "{{ .Tag }}-next"
+
+# Skip upload to package managers (since this is a Go module)
+# nfpms section is omitted entirely since we're not building packages
+
+# Docker configuration (skip for library)
+# dockers section is omitted entirely since we're not building Docker images
+
+# Source configuration
+source:
+  enabled: true
+  name_template: "{{ .ProjectName }}_{{ .Version }}_source"
+
+# Git configuration
+git:
+  # Tag sort order
+  tag_sort: -version:refname
+  
+  # Skip commits from these paths in changelog
+  ignore_tags:
+    - ".*-rc.*"
+    - ".*-beta.*"
+    - ".*-alpha.*"
