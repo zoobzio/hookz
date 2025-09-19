@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/zoobzio/clockz"
 )
 
 // Service test constants demonstrating Key patterns
@@ -603,4 +604,29 @@ func TestCombinedResilienceConfiguration(t *testing.T) {
 		// Service should initialize with both resilience configurations
 		assert.NotNil(t, service)
 	})
+}
+
+// TestWithClock validates the WithClock option sets a custom clock
+func TestWithClock(t *testing.T) {
+	// Use a fake clock from clockz
+	fakeClock := clockz.NewFakeClockAt(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	// Create service with custom clock
+	service := New[string](WithClock(fakeClock))
+	defer service.Close()
+
+	// Verify service was created with custom clock
+	assert.NotNil(t, service)
+	assert.NotNil(t, service.workers)
+	assert.Same(t, fakeClock, service.workers.clock)
+
+	// Service should function normally with custom clock
+	hook, err := service.Hook(ServiceTestEvent, func(ctx context.Context, data string) error {
+		return nil
+	})
+	require.NoError(t, err)
+	defer hook.Unhook()
+
+	err = service.Emit(context.Background(), ServiceTestEvent, "test")
+	assert.NoError(t, err)
 }

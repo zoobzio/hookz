@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/zoobzio/clockz"
 )
 
 // Test constants for worker pool operations
@@ -330,5 +331,263 @@ func TestOverflowQueueLogic(t *testing.T) {
 		if processedCount == 0 {
 			t.Error("overflow drain should have processed some tasks")
 		}
+	})
+}
+
+// TestSubmitWithBackpressureThenOverflow tests the combined backpressure and overflow submission path
+func TestSubmitWithBackpressureThenOverflow(t *testing.T) {
+	t.Run("HandlesBackpressureThenOverflow", func(t *testing.T) {
+		service := New[int](
+			WithWorkers(1),
+			WithQueueSize(3),
+			WithBackpressure(BackpressureConfig{
+				MaxWait:        5 * time.Millisecond,
+				StartThreshold: 0.5,
+				Strategy:       "fixed",
+			}),
+			WithOverflow(OverflowConfig{
+				Capacity:         5,
+				DrainInterval:    10 * time.Millisecond,
+				EvictionStrategy: "reject",
+			}),
+		)
+		defer service.Close()
+
+		// Block the worker to fill the queue
+		blocked := make(chan struct{})
+		unblock := make(chan struct{})
+		hook, err := service.Hook("test", func(ctx context.Context, v int) error {
+			if v == 0 {
+				close(blocked)
+				<-unblock
+			}
+			return nil
+		})
+		require.NoError(t, err)
+		defer hook.Unhook()
+
+		// Send first task to block worker
+		err = service.Emit(context.Background(), "test", 0)
+		require.NoError(t, err)
+		<-blocked
+
+		// Fill primary queue to trigger backpressure
+		for i := 1; i <= 3; i++ {
+			err = service.Emit(context.Background(), "test", i)
+			require.NoError(t, err, "should accept into primary queue")
+		}
+
+		// Now primary is full, next should use backpressure then overflow
+		start := time.Now()
+		err = service.Emit(context.Background(), "test", 4)
+		elapsed := time.Since(start)
+
+		// Should have waited due to backpressure
+		assert.NoError(t, err)
+		assert.GreaterOrEqual(t, elapsed, 2*time.Millisecond, "should have applied backpressure delay")
+
+		// Fill overflow (capacity is 5, we've sent 5 items: 0-4)
+		for i := 5; i <= 8; i++ {
+			err = service.Emit(context.Background(), "test", i)
+			assert.NoError(t, err, "should accept into overflow")
+		}
+
+		// Both primary (3) and overflow (5) full, next should be rejected
+		err = service.Emit(context.Background(), "test", 9)
+		assert.ErrorIs(t, err, ErrQueueFull)
+
+		close(unblock)
+	})
+
+	t.Run("RespectsMaxWaitTimeout", func(t *testing.T) {
+		service := New[int](
+			WithWorkers(1),
+			WithQueueSize(2),
+			WithBackpressure(BackpressureConfig{
+				MaxWait:        10 * time.Millisecond,
+				StartThreshold: 0.5,
+				Strategy:       "exponential",
+			}),
+			WithOverflow(OverflowConfig{
+				Capacity:         3,
+				DrainInterval:    20 * time.Millisecond,
+				EvictionStrategy: "lifo",
+			}),
+		)
+		defer service.Close()
+
+		// Block worker
+		blocked := make(chan struct{})
+		hook, err := service.Hook("test", func(ctx context.Context, v int) error {
+			if v == 0 {
+				close(blocked)
+				time.Sleep(100 * time.Millisecond) // Hold worker busy
+			}
+			return nil
+		})
+		require.NoError(t, err)
+		defer hook.Unhook()
+
+		// Block the worker
+		service.Emit(context.Background(), "test", 0)
+		<-blocked
+
+		// Fill primary queue
+		service.Emit(context.Background(), "test", 1)
+		service.Emit(context.Background(), "test", 2)
+
+		// Next emit should wait up to MaxWait then use overflow
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+
+		err = service.Emit(ctx, "test", 3)
+		assert.NoError(t, err, "should succeed using overflow after backpressure wait")
+	})
+}
+
+// TestCalculateBackpressureDelay tests edge cases in backpressure delay calculation
+func TestCalculateBackpressureDelay(t *testing.T) {
+	backpressureConfig := &BackpressureConfig{
+		MaxWait:        100 * time.Millisecond,
+		StartThreshold: 0.7,
+		Strategy:       "linear",
+	}
+	wp := &workerPool[int]{
+		backpressure: backpressureConfig,
+		tasks:        make(chan hookTask[int], 100),
+	}
+
+	t.Run("BelowThreshold", func(t *testing.T) {
+		delay := wp.calculateBackpressureDelay(0.5) // 50% full
+		assert.Equal(t, time.Duration(0), delay, "should not apply delay below threshold")
+	})
+
+	t.Run("AtThreshold", func(t *testing.T) {
+		delay := wp.calculateBackpressureDelay(0.7) // Exactly at threshold
+		assert.Equal(t, time.Duration(0), delay, "should not apply delay exactly at threshold")
+	})
+
+	t.Run("AboveThreshold", func(t *testing.T) {
+		delay := wp.calculateBackpressureDelay(0.85) // 85% full
+		assert.Greater(t, delay, time.Duration(0), "should apply delay above threshold")
+		assert.LessOrEqual(t, delay, wp.backpressure.MaxWait, "should not exceed max wait")
+	})
+
+	t.Run("AtCapacity", func(t *testing.T) {
+		delay := wp.calculateBackpressureDelay(1.0) // 100% full
+		assert.Equal(t, wp.backpressure.MaxWait, delay, "should apply max delay at capacity")
+	})
+
+	t.Run("FixedStrategy", func(t *testing.T) {
+		wp.backpressure.Strategy = "fixed"
+		delay := wp.calculateBackpressureDelay(0.85)
+		assert.Equal(t, wp.backpressure.MaxWait, delay, "fixed strategy should always use max wait")
+	})
+
+	t.Run("ExponentialStrategy", func(t *testing.T) {
+		wp.backpressure.Strategy = "exponential"
+		delay1 := wp.calculateBackpressureDelay(0.75)
+		delay2 := wp.calculateBackpressureDelay(0.85)
+		delay3 := wp.calculateBackpressureDelay(0.95)
+
+		assert.Less(t, delay1, delay2, "exponential should increase with queue depth")
+		assert.Less(t, delay2, delay3, "exponential should increase more steeply")
+		assert.LessOrEqual(t, delay3, wp.backpressure.MaxWait, "should cap at max wait")
+	})
+
+	t.Run("ZeroMaxWait", func(t *testing.T) {
+		wp.backpressure.MaxWait = 0
+		delay := wp.calculateBackpressureDelay(0.9)
+		assert.Equal(t, time.Duration(0), delay, "should return zero when max wait is zero")
+	})
+}
+
+// TestOverflowQueueEnqueue tests the overflow queue enqueue function
+func TestOverflowQueueEnqueue(t *testing.T) {
+	clock := clockz.RealClock
+	oq := &overflowQueue[string]{
+		capacity: 5,
+		strategy: "fifo",
+		clock:    clock,
+	}
+
+	t.Run("EnqueueToEmptyQueue", func(t *testing.T) {
+		task := hookTask[string]{
+			event: "test",
+			data:  "data1",
+			ctx:   context.Background(),
+		}
+
+		err := oq.enqueue(task)
+		assert.NoError(t, err, "should enqueue to empty queue")
+		assert.Equal(t, 1, len(oq.items), "queue should have one item")
+	})
+
+	t.Run("EnqueueToPartialQueue", func(t *testing.T) {
+		// Add more items
+		for i := 2; i <= 3; i++ {
+			task := hookTask[string]{
+				event: fmt.Sprintf("test%d", i),
+				data:  fmt.Sprintf("data%d", i),
+				ctx:   context.Background(),
+			}
+			err := oq.enqueue(task)
+			assert.NoError(t, err, "should enqueue to partial queue")
+		}
+		assert.Equal(t, 3, len(oq.items), "queue should have three items")
+	})
+
+	t.Run("EnqueueToFullQueueFIFO", func(t *testing.T) {
+		// Fill the queue
+		for i := 4; i <= 5; i++ {
+			task := hookTask[string]{
+				event: fmt.Sprintf("test%d", i),
+				data:  fmt.Sprintf("data%d", i),
+				ctx:   context.Background(),
+			}
+			oq.enqueue(task)
+		}
+
+		// Try to enqueue when full with FIFO strategy
+		task := hookTask[string]{
+			event: "overflow",
+			data:  "new_item",
+			ctx:   context.Background(),
+		}
+
+		err := oq.enqueue(task)
+		assert.NoError(t, err, "FIFO should drop oldest and add new")
+		assert.Equal(t, 5, len(oq.items), "queue should remain at capacity")
+		assert.Equal(t, "new_item", oq.items[4].data, "newest item should be at end")
+	})
+
+	t.Run("EnqueueRejectStrategy", func(t *testing.T) {
+		// Create new queue with reject strategy
+		rejectQueue := &overflowQueue[string]{
+			capacity: 2,
+			strategy: "reject",
+			clock:    clock,
+		}
+
+		// Fill the queue
+		for i := 0; i < 2; i++ {
+			task := hookTask[string]{
+				event: fmt.Sprintf("test%d", i),
+				data:  fmt.Sprintf("data%d", i),
+				ctx:   context.Background(),
+			}
+			rejectQueue.enqueue(task)
+		}
+
+		// Try to enqueue when full
+		task := hookTask[string]{
+			event: "overflow",
+			data:  "should_fail",
+			ctx:   context.Background(),
+		}
+
+		err := rejectQueue.enqueue(task)
+		assert.ErrorIs(t, err, ErrQueueFull, "reject strategy should return error when full")
+		assert.Equal(t, 2, len(rejectQueue.items), "queue should remain at capacity")
 	})
 }
