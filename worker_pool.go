@@ -2,6 +2,7 @@ package hookz
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -322,7 +323,9 @@ func (p *workerPool[T]) worker() {
 		// itself is responsible for respecting context cancellation
 		if err := p.executeHookSafely(task); err != nil {
 			// Check if error was due to context cancellation
-			if task.ctx.Err() != nil {
+			// We check both if the task context has an error AND if the returned error
+			// is a context error (DeadlineExceeded or Canceled)
+			if task.ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				atomic.AddInt64(&p.metrics.TasksExpired, 1)
 			} else {
 				atomic.AddInt64(&p.metrics.TasksFailed, 1)
