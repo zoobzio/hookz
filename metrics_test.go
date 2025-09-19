@@ -425,6 +425,9 @@ func TestMetricsPanicHandling(t *testing.T) {
 		t.Fatal("Task did not complete in time")
 	}
 
+	// Give worker time to update metrics after panic recovery
+	time.Sleep(10 * time.Millisecond)
+
 	// Check metrics - panic should be counted as failure
 	metrics := service.Metrics()
 	assert.Equal(t, int64(0), metrics.TasksProcessed, "Should show 0 processed tasks")
