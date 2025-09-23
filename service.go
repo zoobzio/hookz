@@ -140,7 +140,8 @@ const (
 type Hooks[T any] struct {
 	clock         clockz.Clock // Time abstraction injected at creation
 	hooks         map[string][]hookEntry[T]
-	workers       *workerPool[T]
+	workers       *workerPool[T] // Lazily initialized on first hook registration
+	workerConfig  *config        // Stored config for lazy worker pool creation
 	mu            sync.RWMutex
 	GlobalTimeout time.Duration
 	totalHooks    int // Tracks total hook count across all events
@@ -191,10 +192,20 @@ func New[T any](opts ...Option) *Hooks[T] {
 		GlobalTimeout: cfg.timeout,
 		closed:        false,
 		totalHooks:    0,
+		workerConfig:  &cfg, // Store config for lazy initialization
+		// workers field remains nil until first hook is registered
 	}
 
-	impl.workers = newWorkerPoolWithResilience[T](cfg, &impl.metrics)
+	// Don't create worker pool here - wait until first hook
 	return impl
+}
+
+// initWorkerPool lazily initializes the worker pool if not already created.
+// Must be called with mutex already held.
+func (h *Hooks[T]) initWorkerPool() {
+	if h.workers == nil && h.workerConfig != nil {
+		h.workers = newWorkerPoolWithResilience[T](*h.workerConfig, &h.metrics)
+	}
 }
 
 // Hook registers a callback function for the specified event.
@@ -217,6 +228,9 @@ func (h *Hooks[T]) Hook(event Key, callback func(context.Context, T) error) (Hoo
 	if h.totalHooks >= maxTotalHooks {
 		return Hook{}, ErrTooManyHooks
 	}
+
+	// Lazily initialize worker pool on first hook registration
+	h.initWorkerPool()
 
 	// Create new hook entry
 	id := h.generateID()
@@ -309,10 +323,17 @@ func (h *Hooks[T]) Emit(ctx context.Context, event Key, data T) error {
 	originalHooks := h.hooks[event]
 	hooks := make([]hookEntry[T], len(originalHooks))
 	copy(hooks, originalHooks)
+	workers := h.workers // Capture worker pool reference
 	h.mu.RUnlock()
 
-	// No hooks registered for this event
+	// No hooks registered for this event - no-op
 	if len(hooks) == 0 {
+		return nil
+	}
+
+	// No worker pool means no hooks have been registered yet
+	// This shouldn't happen if hooks exist, but handle gracefully
+	if workers == nil {
 		return nil
 	}
 
@@ -325,7 +346,7 @@ func (h *Hooks[T]) Emit(ctx context.Context, event Key, data T) error {
 			event: event,
 		}
 
-		if err := h.workers.submit(task); err != nil {
+		if err := workers.submit(task); err != nil {
 			// Worker pool is full - return error immediately
 			return err
 		}
@@ -340,11 +361,18 @@ func (h *Hooks[T]) Emit(ctx context.Context, event Key, data T) error {
 func (h *Hooks[T]) Metrics() Metrics {
 	h.mu.RLock()
 	registeredHooks := int64(h.totalHooks)
+	workers := h.workers // Capture worker pool reference
 	h.mu.RUnlock()
+
+	// Calculate queue capacity - 0 if no worker pool initialized
+	var queueCapacity int64
+	if workers != nil {
+		queueCapacity = int64(cap(workers.tasks))
+	}
 
 	return Metrics{
 		QueueDepth:      atomic.LoadInt64(&h.metrics.QueueDepth),
-		QueueCapacity:   int64(cap(h.workers.tasks)),
+		QueueCapacity:   queueCapacity,
 		TasksProcessed:  atomic.LoadInt64(&h.metrics.TasksProcessed),
 		TasksRejected:   atomic.LoadInt64(&h.metrics.TasksRejected),
 		TasksFailed:     atomic.LoadInt64(&h.metrics.TasksFailed),
@@ -365,16 +393,20 @@ func (h *Hooks[T]) Close() error {
 		return ErrAlreadyClosed
 	}
 	h.closed = true
+	workers := h.workers // Capture worker pool reference
 	h.mu.Unlock()
 
-	// Shutdown worker pool - this waits for queued hooks to complete
-	h.workers.close()
+	// Only shutdown worker pool if it was initialized
+	if workers != nil {
+		// Shutdown worker pool - this waits for queued hooks to complete
+		workers.close()
 
-	// Count remaining tasks as expired for metrics consistency
-	remaining := atomic.LoadInt64(&h.metrics.QueueDepth)
-	if remaining > 0 {
-		atomic.AddInt64(&h.metrics.TasksExpired, remaining)
-		atomic.StoreInt64(&h.metrics.QueueDepth, 0)
+		// Count remaining tasks as expired for metrics consistency
+		remaining := atomic.LoadInt64(&h.metrics.QueueDepth)
+		if remaining > 0 {
+			atomic.AddInt64(&h.metrics.TasksExpired, remaining)
+			atomic.StoreInt64(&h.metrics.QueueDepth, 0)
+		}
 	}
 
 	return nil

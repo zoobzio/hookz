@@ -114,13 +114,14 @@ func TestServiceImplementationDetails(t *testing.T) {
 	// Initial state should be correct
 	assert.False(t, service.closed)
 	assert.NotNil(t, service.hooks)
-	assert.NotNil(t, service.workers)
+	assert.Nil(t, service.workers) // Should be nil until first hook
 
 	// Register a hook and check internal state
 	hook, err := service.Hook(ServiceImplTestEvent, func(ctx context.Context, data string) error { return nil })
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, len(service.hooks[ServiceImplTestEvent]))
+	assert.NotNil(t, service.workers) // Worker pool should be created after first hook
 
 	// Unhook and verify cleanup
 	err = hook.Unhook()
@@ -617,8 +618,7 @@ func TestWithClock(t *testing.T) {
 
 	// Verify service was created with custom clock
 	assert.NotNil(t, service)
-	assert.NotNil(t, service.workers)
-	assert.Same(t, fakeClock, service.workers.clock)
+	assert.Nil(t, service.workers) // Workers not created until first hook
 
 	// Service should function normally with custom clock
 	hook, err := service.Hook(ServiceTestEvent, func(ctx context.Context, data string) error {
@@ -627,6 +627,136 @@ func TestWithClock(t *testing.T) {
 	require.NoError(t, err)
 	defer hook.Unhook()
 
+	// After registering a hook, workers should be created with custom clock
+	assert.NotNil(t, service.workers)
+	assert.Same(t, fakeClock, service.workers.clock)
+
 	err = service.Emit(context.Background(), ServiceTestEvent, "test")
 	assert.NoError(t, err)
+}
+
+// TestLazyWorkerPoolInitialization verifies that worker pools are not created
+// until the first hook is registered, optimizing resource usage.
+func TestLazyWorkerPoolInitialization(t *testing.T) {
+	t.Run("NoWorkerPoolBeforeHooks", func(t *testing.T) {
+		service := New[string]()
+		defer service.Close()
+
+		// Worker pool should not exist initially
+		assert.Nil(t, service.workers, "Worker pool should be nil before any hooks")
+
+		// Metrics should still work with nil worker pool
+		metrics := service.Metrics()
+		assert.Equal(t, int64(0), metrics.QueueCapacity, "Queue capacity should be 0 with no worker pool")
+		assert.Equal(t, int64(0), metrics.RegisteredHooks, "No hooks registered yet")
+
+		// Emit should be no-op with no hooks (and no worker pool)
+		err := service.Emit(context.Background(), "test.event", "data")
+		assert.NoError(t, err, "Emit should succeed with no hooks")
+		assert.Nil(t, service.workers, "Worker pool should still be nil after emit with no hooks")
+	})
+
+	t.Run("WorkerPoolCreatedOnFirstHook", func(t *testing.T) {
+		service := New[string](WithWorkers(5), WithQueueSize(10))
+		defer service.Close()
+
+		// Worker pool should not exist initially
+		assert.Nil(t, service.workers, "Worker pool should be nil initially")
+
+		// Register first hook
+		hook, err := service.Hook("test.event", func(ctx context.Context, data string) error {
+			return nil
+		})
+		require.NoError(t, err)
+		defer hook.Unhook()
+
+		// Worker pool should now exist
+		assert.NotNil(t, service.workers, "Worker pool should be created after first hook")
+
+		// Verify configuration was applied
+		metrics := service.Metrics()
+		assert.Equal(t, int64(10), metrics.QueueCapacity, "Queue capacity should match configuration")
+	})
+
+	t.Run("MultipleServicesIndependentInitialization", func(t *testing.T) {
+		// Create multiple services
+		service1 := New[string]()
+		service2 := New[int]()
+		service3 := New[bool]()
+		defer service1.Close()
+		defer service2.Close()
+		defer service3.Close()
+
+		// All should start without worker pools
+		assert.Nil(t, service1.workers, "Service1 should have no worker pool")
+		assert.Nil(t, service2.workers, "Service2 should have no worker pool")
+		assert.Nil(t, service3.workers, "Service3 should have no worker pool")
+
+		// Register hook only on service2
+		hook, err := service2.Hook("test", func(ctx context.Context, data int) error {
+			return nil
+		})
+		require.NoError(t, err)
+		defer hook.Unhook()
+
+		// Only service2 should have a worker pool
+		assert.Nil(t, service1.workers, "Service1 should still have no worker pool")
+		assert.NotNil(t, service2.workers, "Service2 should have a worker pool after hook")
+		assert.Nil(t, service3.workers, "Service3 should still have no worker pool")
+	})
+
+	t.Run("NoResourcesForUnusedService", func(t *testing.T) {
+		// Create a service that will never be used
+		service := New[string]()
+		defer service.Close()
+
+		// Verify no resources allocated
+		assert.Nil(t, service.workers, "Unused service should have no worker pool")
+
+		metrics := service.Metrics()
+		assert.Equal(t, int64(0), metrics.QueueCapacity, "No queue capacity for unused service")
+		assert.Equal(t, int64(0), metrics.RegisteredHooks, "No hooks for unused service")
+
+		// Close should work fine with no worker pool
+		err := service.Close()
+		assert.NoError(t, err, "Close should succeed even with no worker pool")
+	})
+
+	t.Run("WorkerPoolPersistsAfterUnhook", func(t *testing.T) {
+		service := New[string]()
+		defer service.Close()
+
+		// Register and then unhook
+		hook, err := service.Hook("test", func(ctx context.Context, data string) error {
+			return nil
+		})
+		require.NoError(t, err)
+
+		assert.NotNil(t, service.workers, "Worker pool should exist after hook")
+
+		err = hook.Unhook()
+		require.NoError(t, err)
+
+		// Worker pool should persist even after all hooks removed
+		// (to avoid recreating it if hooks are re-added)
+		assert.NotNil(t, service.workers, "Worker pool should persist after unhook")
+	})
+
+	t.Run("EmitWithNoHooksNoWorkers", func(t *testing.T) {
+		service := New[string]()
+		defer service.Close()
+
+		// Create a context with timeout to ensure emit doesn't block
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		// Multiple emits with no hooks and no worker pool
+		for i := 0; i < 100; i++ {
+			err := service.Emit(ctx, "test.event", "data")
+			assert.NoError(t, err, "Emit should be no-op with no hooks")
+		}
+
+		// Verify no worker pool was created
+		assert.Nil(t, service.workers, "No worker pool should be created for emit-only operations")
+	})
 }

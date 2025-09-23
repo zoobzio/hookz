@@ -14,16 +14,27 @@ func TestMetricsStructure(t *testing.T) {
 	service := New[string]()
 	defer service.Close()
 
+	// Before hooks, queue capacity should be 0
 	metrics := service.Metrics()
+	assert.Equal(t, int64(0), metrics.QueueCapacity, "QueueCapacity should be 0 before hooks")
+
+	// Register a hook to initialize worker pool
+	hook, err := service.Hook("test", func(ctx context.Context, data string) error {
+		return nil
+	})
+	require.NoError(t, err)
+	defer hook.Unhook()
+
+	metrics = service.Metrics()
 
 	// Verify all metrics fields are present and properly initialized
 	assert.Equal(t, int64(0), metrics.QueueDepth, "QueueDepth should start at 0")
-	assert.Greater(t, metrics.QueueCapacity, int64(0), "QueueCapacity should be positive")
+	assert.Greater(t, metrics.QueueCapacity, int64(0), "QueueCapacity should be positive after hook")
 	assert.Equal(t, int64(0), metrics.TasksProcessed, "TasksProcessed should start at 0")
 	assert.Equal(t, int64(0), metrics.TasksRejected, "TasksRejected should start at 0")
 	assert.Equal(t, int64(0), metrics.TasksFailed, "TasksFailed should start at 0")
 	assert.Equal(t, int64(0), metrics.TasksExpired, "TasksExpired should start at 0")
-	assert.Equal(t, int64(0), metrics.RegisteredHooks, "RegisteredHooks should start at 0")
+	assert.Equal(t, int64(1), metrics.RegisteredHooks, "RegisteredHooks should be 1")
 
 	// Phase 2 metrics should be 0 initially
 	assert.Equal(t, int64(0), metrics.OverflowDepth, "OverflowDepth should be 0 in Phase 1")
@@ -92,15 +103,27 @@ func TestMetricsQueueCapacity(t *testing.T) {
 		}
 
 		service := New[string](options...)
-		metrics := service.Metrics()
 
+		// Queue capacity should be 0 before hooks
+		metrics := service.Metrics()
+		assert.Equal(t, int64(0), metrics.QueueCapacity,
+			"QueueCapacity should be 0 before hooks")
+
+		// Register a hook to initialize worker pool
+		hook, err := service.Hook("test", func(ctx context.Context, data string) error {
+			return nil
+		})
+		require.NoError(t, err)
+		defer hook.Unhook()
+
+		metrics = service.Metrics()
 		expectedCapacity := tc.queueSize
 		if expectedCapacity == 0 {
 			expectedCapacity = tc.workers * 2 // auto-calculated
 		}
 
 		assert.Equal(t, int64(expectedCapacity), metrics.QueueCapacity,
-			"QueueCapacity should match configured size")
+			"QueueCapacity should match configured size after hook")
 
 		service.Close()
 	}
