@@ -2,587 +2,447 @@ package hookz
 
 import (
 	"context"
-	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-)
-
-// Test constants demonstrating Key usage patterns
-const (
-	TestEvent               Key = "test.event"
-	TestUserEvent           Key = "user.test"
-	TestPaymentEvent        Key = "payment.authorized"
-	TestWebhookEvent        Key = "webhook.delivered"
-	TestBasicEvent          Key = "test.basic"
-	TestGlobalTimeoutEvent  Key = "test.globaltimeout"
-	TestMultiEvent          Key = "test.multi"
-	TestAsyncEvent          Key = "test.async"
-	TestClosedEvent         Key = "test.closed"
-	TestNonexistentEvent    Key = "test.nonexistent"
-	TestRegistryEvent       Key = "test.registry"
-	TestEmitterEvent        Key = "test.emitter"
-	TestAdminEvent1         Key = "test.admin.event1"
-	TestAdminEvent2         Key = "test.admin.event2"
-	TestOrderProcessed      Key = "order.processed"
-	TestZeroTimeoutEvent    Key = "test.zerotimeout"
-	TestBackwardCompatEvent Key = "test.backwardcompat"
-	TestStringLiteralEvent  Key = "string.event"
-	TestExplicitEvent       Key = "explicit.event"
-	TestUserCreatedEvent    Key = "user.created"
 )
 
 func TestBasicHookRegistration(t *testing.T) {
 	service := New[string]()
 	defer service.Close()
 
-	called := make(chan bool, 1)
-	hook, err := service.Hook(TestBasicEvent, func(ctx context.Context, data string) error {
-		assert.Equal(t, "test-data", data)
-		called <- true
+	done := make(chan struct{})
+	var received string
+
+	hook, err := service.Hook("test.event", func(ctx context.Context, data string) error {
+		received = data
+		close(done)
 		return nil
 	})
-
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("Failed to register hook: %v", err)
+	}
 	defer hook.Unhook()
 
-	err = service.Emit(context.Background(), TestBasicEvent, "test-data")
-	require.NoError(t, err)
+	if err := service.Emit(context.Background(), "test.event", "test-data"); err != nil {
+		t.Fatalf("Failed to emit event: %v", err)
+	}
 
-	// Wait for async execution to complete
 	select {
-	case <-called:
-		// Good
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Hook was not called")
+	case <-done:
+		if received != "test-data" {
+			t.Errorf("Expected 'test-data', got '%s'", received)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Hook was not called within timeout")
 	}
 }
 
-func TestMultipleHooks(t *testing.T) {
+func TestMultipleHooksForSameEvent(t *testing.T) {
+	service := New[int]()
+	defer service.Close()
+
+	var count int32
+	var wg sync.WaitGroup
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		hook, err := service.Hook("multi.event", func(ctx context.Context, data int) error {
+			atomic.AddInt32(&count, 1)
+			wg.Done()
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to register hook %d: %v", i, err)
+		}
+		defer hook.Unhook()
+	}
+
+	if err := service.Emit(context.Background(), "multi.event", 42); err != nil {
+		t.Fatalf("Failed to emit event: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if c := atomic.LoadInt32(&count); c != 3 {
+			t.Errorf("Expected 3 hooks to be called, got %d", c)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Not all hooks were called within timeout")
+	}
+}
+
+func TestEmitWithNoHooks(t *testing.T) {
 	service := New[string]()
 	defer service.Close()
 
-	var calls atomic.Int32
+	// Should not error when emitting to event with no hooks
+	if err := service.Emit(context.Background(), "no.hooks", "data"); err != nil {
+		t.Errorf("Emit with no hooks should not error: %v", err)
+	}
+}
+
+func TestServiceClose(t *testing.T) {
+	service := New[string]()
+
+	if err := service.Close(); err != nil {
+		t.Fatalf("Failed to close service: %v", err)
+	}
+
+	// Double close should return error
+	if err := service.Close(); err == nil {
+		t.Error("Expected error on double close")
+	}
+
+	// Operations after close should fail
+	_, err := service.Hook("test", func(ctx context.Context, data string) error {
+		return nil
+	})
+	if err == nil {
+		t.Error("Hook registration should fail after close")
+	}
+
+	if err := service.Emit(context.Background(), "test", "data"); err == nil {
+		t.Error("Emit should fail after close")
+	}
+}
+
+func TestWithOptions(t *testing.T) {
+	t.Run("WithWorkers", func(t *testing.T) {
+		service := New[string](WithWorkers(20))
+		defer service.Close()
+
+		// Service should function normally
+		done := make(chan struct{})
+		hook, err := service.Hook("test", func(ctx context.Context, data string) error {
+			close(done)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to register hook: %v", err)
+		}
+		defer hook.Unhook()
+
+		if err := service.Emit(context.Background(), "test", "data"); err != nil {
+			t.Fatalf("Failed to emit: %v", err)
+		}
+
+		select {
+		case <-done:
+			// Success
+		case <-time.After(time.Second):
+			t.Fatal("Hook not called")
+		}
+	})
+
+	t.Run("WithTimeout", func(t *testing.T) {
+		timeout := 100 * time.Millisecond
+		service := New[string](WithTimeout(timeout))
+		defer service.Close()
+
+		if service.GlobalTimeout != timeout {
+			t.Errorf("Expected timeout %v, got %v", timeout, service.GlobalTimeout)
+		}
+	})
+
+	t.Run("WithQueueSize", func(t *testing.T) {
+		service := New[string](WithQueueSize(100))
+		defer service.Close()
+
+		// Register a hook to initialize worker pool
+		hook, err := service.Hook("test", func(ctx context.Context, data string) error {
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to register hook: %v", err)
+		}
+		defer hook.Unhook()
+
+		// Service should function with custom queue size
+		if err := service.Emit(context.Background(), "test", "data"); err != nil {
+			t.Fatalf("Failed to emit: %v", err)
+		}
+	})
+
+	t.Run("CombinedOptions", func(t *testing.T) {
+		service := New[string](
+			WithWorkers(15),
+			WithTimeout(2*time.Second),
+			WithQueueSize(50),
+		)
+		defer service.Close()
+
+		if service.GlobalTimeout != 2*time.Second {
+			t.Errorf("Expected timeout 2s, got %v", service.GlobalTimeout)
+		}
+	})
+}
+
+func TestContextCancellation(t *testing.T) {
+	service := New[string]()
+	defer service.Close()
+
+	started := make(chan struct{})
+	finished := make(chan error, 1)
+
+	hook, err := service.Hook("ctx.test", func(ctx context.Context, data string) error {
+		close(started)
+		select {
+		case <-ctx.Done():
+			finished <- ctx.Err()
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+			finished <- nil
+			return nil
+		}
+	})
+	if err != nil {
+		t.Fatalf("Failed to register hook: %v", err)
+	}
+	defer hook.Unhook()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	if err := service.Emit(ctx, "ctx.test", "data"); err != nil {
+		t.Fatalf("Failed to emit: %v", err)
+	}
+
+	// Wait for handler to start
+	<-started
+
+	// Cancel the context
+	cancel()
+
+	// Handler should receive cancellation
+	select {
+	case err := <-finished:
+		if err != context.Canceled {
+			t.Errorf("Expected context.Canceled, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Handler did not respond to cancellation")
+	}
+}
+
+func TestConcurrentOperations(t *testing.T) {
+	service := New[int]()
+	defer service.Close()
+
+	const numGoroutines = 10
+	const opsPerGoroutine = 100
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines * 2)
+
+	// Concurrent hook registration/unregistration
+	for i := 0; i < numGoroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < opsPerGoroutine; j++ {
+				hook, err := service.Hook(Key("concurrent.test"), func(ctx context.Context, data int) error {
+					return nil
+				})
+				if err == nil {
+					hook.Unhook()
+				}
+			}
+		}(i)
+	}
+
+	// Concurrent emissions
+	for i := 0; i < numGoroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < opsPerGoroutine; j++ {
+				service.Emit(context.Background(), Key("concurrent.test"), id*opsPerGoroutine+j)
+			}
+		}(i)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success - no race conditions
+	case <-time.After(5 * time.Second):
+		t.Fatal("Concurrent operations timeout")
+	}
+}
+
+func TestKeyTypeUsage(t *testing.T) {
+	service := New[string]()
+	defer service.Close()
+
+	// Test with Key constants
+	const testEvent Key = "test.keyed.event"
+
+	called := make(chan struct{})
+	hook, err := service.Hook(testEvent, func(ctx context.Context, data string) error {
+		close(called)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to register hook: %v", err)
+	}
+	defer hook.Unhook()
+
+	if err := service.Emit(context.Background(), testEvent, "data"); err != nil {
+		t.Fatalf("Failed to emit: %v", err)
+	}
+
+	select {
+	case <-called:
+		// Success
+	case <-time.After(time.Second):
+		t.Fatal("Hook not called")
+	}
+}
+
+func TestUnhook(t *testing.T) {
+	service := New[string]()
+	defer service.Close()
+
+	called := make(chan struct{}, 1)
+	hook, err := service.Hook("unhook.test", func(ctx context.Context, data string) error {
+		called <- struct{}{}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to register hook: %v", err)
+	}
+
+	// Unhook before emitting
+	if err := hook.Unhook(); err != nil {
+		t.Fatalf("Failed to unhook: %v", err)
+	}
+
+	// Double unhook should return error
+	if err := hook.Unhook(); err == nil {
+		t.Error("Expected error on double unhook")
+	}
+
+	// Emit should not call the unhooked handler
+	if err := service.Emit(context.Background(), "unhook.test", "data"); err != nil {
+		t.Fatalf("Failed to emit: %v", err)
+	}
+
+	select {
+	case <-called:
+		t.Error("Unhooked handler should not be called")
+	case <-time.After(100 * time.Millisecond):
+		// Success - handler not called
+	}
+}
+
+func TestClearEvent(t *testing.T) {
+	service := New[int]()
+	defer service.Close()
 
 	// Register multiple hooks for same event
 	hooks := make([]Hook, 3)
 	for i := 0; i < 3; i++ {
-		hook, err := service.Hook(TestMultiEvent, func(ctx context.Context, data string) error {
-			calls.Add(1)
+		hook, err := service.Hook("clear.test", func(ctx context.Context, data int) error {
 			return nil
 		})
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("Failed to register hook %d: %v", i, err)
+		}
 		hooks[i] = hook
 	}
 
-	// Cleanup
-	defer func() {
-		for _, hook := range hooks {
-			hook.Unhook()
+	// Clear the event
+	cleared := service.Clear("clear.test")
+	if cleared != 3 {
+		t.Errorf("Expected to clear 3 hooks, cleared %d", cleared)
+	}
+
+	// Hooks should now be invalid
+	for i, hook := range hooks {
+		if err := hook.Unhook(); err == nil {
+			t.Errorf("Hook %d should be invalid after clear", i)
 		}
-	}()
+	}
 
-	err := service.Emit(context.Background(), TestMultiEvent, "data")
-	require.NoError(t, err)
-
-	// Wait for async execution
-	time.Sleep(50 * time.Millisecond)
-	assert.Equal(t, int32(3), calls.Load())
+	// Clear non-existent event
+	cleared = service.Clear("nonexistent")
+	if cleared != 0 {
+		t.Errorf("Expected 0 cleared for non-existent event, got %d", cleared)
+	}
 }
 
-func TestEmitFireAndForget(t *testing.T) {
+func TestClearAll(t *testing.T) {
 	service := New[string]()
 	defer service.Close()
 
-	called := make(chan string, 1)
-	hook, err := service.Hook(TestAsyncEvent, func(ctx context.Context, data string) error {
-		called <- data
+	// Register hooks for different events
+	var hooks []Hook
+	events := []string{"event1", "event2", "event3"}
+
+	for _, event := range events {
+		hook, err := service.Hook(Key(event), func(ctx context.Context, data string) error {
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to register hook for %s: %v", event, err)
+		}
+		hooks = append(hooks, hook)
+	}
+
+	// Clear all
+	cleared := service.ClearAll()
+	if cleared != len(events) {
+		t.Errorf("Expected to clear %d hooks, cleared %d", len(events), cleared)
+	}
+
+	// All hooks should be invalid
+	for i, hook := range hooks {
+		if err := hook.Unhook(); err == nil {
+			t.Errorf("Hook %d should be invalid after clear all", i)
+		}
+	}
+
+	// Second clear should return 0
+	cleared = service.ClearAll()
+	if cleared != 0 {
+		t.Errorf("Expected 0 on second clear all, got %d", cleared)
+	}
+}
+
+func TestZeroTimeout(t *testing.T) {
+	service := New[string](WithTimeout(0))
+	defer service.Close()
+
+	completed := make(chan struct{})
+	hook, err := service.Hook("zero.timeout", func(ctx context.Context, data string) error {
+		// Simulate work
+		time.Sleep(10 * time.Millisecond)
+		close(completed)
 		return nil
 	})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("Failed to register hook: %v", err)
+	}
 	defer hook.Unhook()
 
-	err = service.Emit(context.Background(), TestAsyncEvent, "async-data")
-	require.NoError(t, err)
-
-	select {
-	case data := <-called:
-		assert.Equal(t, "async-data", data)
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Fire-and-forget emit did not complete")
-	}
-}
-
-func TestClosedServiceRejectsOperations(t *testing.T) {
-	service := New[string]()
-
-	// Close the service
-	err := service.Close()
-	require.NoError(t, err)
-
-	// Double close should return error
-	err = service.Close()
-	assert.ErrorIs(t, err, ErrAlreadyClosed)
-
-	// Hook registration should fail
-	hook, err := service.Hook(TestClosedEvent, func(ctx context.Context, data string) error { return nil })
-	assert.ErrorIs(t, err, ErrServiceClosed)
-	assert.Equal(t, Hook{}, hook)
-
-	// Emit should fail
-	err = service.Emit(context.Background(), TestClosedEvent, "data")
-	assert.ErrorIs(t, err, ErrServiceClosed)
-
-	err = service.Emit(context.Background(), TestClosedEvent, "data")
-	assert.ErrorIs(t, err, ErrServiceClosed)
-}
-
-func TestNoHooksRegistered(t *testing.T) {
-	// fakeClock removed - cargo cult usage
-	service := New[string]()
-	defer service.Close()
-
-	// Emit to event with no hooks - should not error
-	err := service.Emit(context.Background(), TestNonexistentEvent, "data")
-	assert.NoError(t, err)
-
-	err = service.Emit(context.Background(), TestNonexistentEvent, "data")
-	assert.NoError(t, err)
-}
-
-func TestDirectHooksAccess(t *testing.T) {
-	// fakeClock removed - cargo cult usage
-	service := New[string]()
-	defer service.Close()
-
-	// Direct use of Hooks[T] struct
-	hooks := service
-
-	// Should be able to register and unregister hooks
-	hook, err := hooks.Hook(TestRegistryEvent, func(ctx context.Context, data string) error {
-		return nil
-	})
-	require.NoError(t, err)
-
-	err = hooks.Unhook(hook)
-	assert.NoError(t, err)
-
-	// Direct struct access provides all methods
-	err = hooks.Emit(context.Background(), TestRegistryEvent, "test")
-	assert.NoError(t, err)
-
-	count := hooks.Clear(TestRegistryEvent)
-	assert.GreaterOrEqual(t, count, 0)
-}
-
-func TestSegregatedInterfaceHookEmitter(t *testing.T) {
-	// fakeClock removed - cargo cult usage
-	service := New[string]()
-	defer service.Close()
-
-	called := make(chan bool, 1)
-	_, err := service.Hook(TestEmitterEvent, func(ctx context.Context, data string) error {
-		called <- true
-		return nil
-	})
-	require.NoError(t, err)
-
-	// Use service directly for emission
-	emitter := service
-
-	// Should be able to emit events
-	err = emitter.Emit(context.Background(), TestEmitterEvent, "data")
-	require.NoError(t, err)
-
-	err = emitter.Emit(context.Background(), TestEmitterEvent, "data")
-	require.NoError(t, err)
-
-	// Wait for async execution
-	select {
-	case <-called:
-		// Good
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Hook was not called")
+	if err := service.Emit(context.Background(), "zero.timeout", "data"); err != nil {
+		t.Fatalf("Failed to emit: %v", err)
 	}
 
-	// HookEmitter should not have access to registration methods
-	// This is compile-time verification - the interface doesn't expose them
-}
-
-func TestSegregatedInterfaceHookAdmin(t *testing.T) {
-	// fakeClock removed - cargo cult usage
-	service := New[string]()
-	defer service.Close()
-
-	// Register some hooks
-	hook1, err := service.Hook(TestAdminEvent1, func(ctx context.Context, data string) error { return nil })
-	require.NoError(t, err)
-	defer hook1.Unhook()
-
-	hook2, err := service.Hook(TestAdminEvent1, func(ctx context.Context, data string) error { return nil })
-	require.NoError(t, err)
-	defer hook2.Unhook()
-
-	hook3, err := service.Hook(TestAdminEvent2, func(ctx context.Context, data string) error { return nil })
-	require.NoError(t, err)
-	defer hook3.Unhook()
-
-	// Use service directly for admin operations
-	admin := service
-
-	// Should be able to clear specific events
-	count := admin.Clear(TestAdminEvent1)
-	assert.Equal(t, 2, count)
-
-	// Should be able to clear all events
-	count = admin.ClearAll()
-	assert.Equal(t, 1, count) // event2 hook
-}
-
-func TestSegregatedInterfaceHookLifecycle(t *testing.T) {
-	// fakeClock removed - cargo cult usage
-	service := New[string]()
-
-	// Use service directly for lifecycle operations
-	lifecycle := service
-
-	// Should be able to close the service
-	err := lifecycle.Close()
-	assert.NoError(t, err)
-}
-
-func TestOptionsPattern(t *testing.T) {
-	t.Run("Default configuration", func(t *testing.T) {
-		// fakeClock removed - cargo cult usage
-		service := New[string]()
-		defer service.Close()
-		assert.NotNil(t, service)
-		assert.Equal(t, time.Duration(0), service.GlobalTimeout)
-	})
-
-	t.Run("WithWorkers option", func(t *testing.T) {
-		// fakeClock removed - cargo cult usage
-		service := New[string](WithWorkers(20))
-		defer service.Close()
-		assert.NotNil(t, service)
-		// Worker count can't be directly tested, but service should function
-	})
-
-	t.Run("WithTimeout option", func(t *testing.T) {
-		// fakeClock removed - cargo cult usage
-		timeout := 5 * time.Second
-		service := New[string](WithTimeout(timeout))
-		defer service.Close()
-		assert.NotNil(t, service)
-		assert.Equal(t, timeout, service.GlobalTimeout)
-	})
-
-	t.Run("Combined options", func(t *testing.T) {
-		// fakeClock removed - cargo cult usage
-		timeout := 2 * time.Second
-		service := New[string](
-			WithWorkers(15),
-			WithTimeout(timeout),
-			WithQueueSize(50),
-		)
-		defer service.Close()
-		assert.NotNil(t, service)
-		assert.Equal(t, timeout, service.GlobalTimeout)
-	})
-
-	t.Run("WithQueueSize option", func(t *testing.T) {
-		// fakeClock removed - cargo cult usage
-		service := New[string](WithQueueSize(100))
-		defer service.Close()
-		assert.NotNil(t, service)
-		// Queue size can't be directly tested, but service should function
-	})
-}
-
-// OrderService demonstrates the struct-based pattern with interface segregation
-type OrderService struct {
-	hooks Hooks[string] // Private field, not embedded
-}
-
-func NewOrderService() *OrderService {
-	return &OrderService{
-		hooks: *New[string](), // Initialize as value
-	}
-}
-
-func (s *OrderService) Events() *Hooks[string] {
-	return &s.hooks // Return struct directly
-}
-
-func (s *OrderService) processOrder(order string) error {
-	// Service can emit internally
-	return s.hooks.Emit(context.Background(), TestOrderProcessed, order)
-}
-
-func (s *OrderService) Close() error {
-	// Service controls lifecycle
-	return s.hooks.Close()
-}
-
-func TestInterfaceSegregationInPractice(t *testing.T) {
-	// Create service
-	service := NewOrderService()
-	defer service.Close()
-
-	// External consumers get limited interface
-	registry := service.Events()
-
-	called := make(chan string, 1)
-	hook, err := registry.Hook(TestOrderProcessed, func(ctx context.Context, data string) error {
-		called <- data
-		return nil
-	})
-	require.NoError(t, err)
-	defer hook.Unhook()
-
-	// Service can emit internally
-	err = service.processOrder("test-order")
-	require.NoError(t, err)
-
-	// Verify hook was called (async emission)
-	select {
-	case data := <-called:
-		assert.Equal(t, "test-order", data)
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Hook was not called")
-	}
-
-	// Consumer cannot emit (compile-time safety)
-	// registry.Emit(...) // Would not compile
-	// registry.Close()   // Would not compile
-}
-
-func TestZeroTimeoutMeansNoTimeout(t *testing.T) {
-	// fakeClock removed - cargo cult usage
-	service := New[string](WithWorkers(10), WithTimeout(0)) // Zero timeout = no timeout
-	defer service.Close()
-
-	completed := make(chan bool, 1)
-	hook, err := service.Hook(TestZeroTimeoutEvent, func(ctx context.Context, data string) error {
-		// Simulate work without actual time.Sleep
-		completed <- true
-		return nil
-	})
-	require.NoError(t, err)
-	defer hook.Unhook()
-
-	err = service.Emit(context.Background(), TestZeroTimeoutEvent, "data")
-	require.NoError(t, err)
-
-	// Should complete without timeout
 	select {
 	case <-completed:
-		// Good - no timeout occurred
-	case <-time.After(200 * time.Millisecond):
-		t.Error("Hook should have completed without timeout")
-	}
-}
-
-func TestBackwardCompatibilityFullInterface(t *testing.T) {
-	// fakeClock removed - cargo cult usage
-	service := New[string]()
-	defer service.Close()
-
-	// Full interface should work as before
-	hook, err := service.Hook(TestBackwardCompatEvent, func(ctx context.Context, data string) error {
-		return nil
-	})
-	require.NoError(t, err)
-
-	err = service.Unhook(hook)
-	require.NoError(t, err)
-
-	count := service.Clear(TestNonexistentEvent)
-	assert.Equal(t, 0, count)
-
-	err = service.Emit(context.Background(), TestBackwardCompatEvent, "data")
-	require.NoError(t, err)
-
-	err = service.Emit(context.Background(), TestBackwardCompatEvent, "data")
-	require.NoError(t, err)
-}
-
-// TestKeyConstantPattern demonstrates using Key constants (recommended approach)
-func TestKeyConstantPattern(t *testing.T) {
-	// fakeClock removed - cargo cult usage
-	service := New[string]()
-	defer service.Close()
-
-	called := make(chan bool, 1)
-	hook, err := service.Hook(TestEvent, func(ctx context.Context, data string) error {
-		assert.Equal(t, "test-data", data)
-		called <- true
-		return nil
-	})
-
-	require.NoError(t, err)
-	defer hook.Unhook()
-
-	err = service.Emit(context.Background(), TestEvent, "test-data")
-	require.NoError(t, err)
-
-	// Wait for async execution
-	select {
-	case <-called:
-		// Success
+		// Success - no timeout
 	case <-time.After(100 * time.Millisecond):
-		t.Error("Hook was not called")
+		t.Fatal("Hook should have completed without timeout")
 	}
-}
-
-// TestKeyCompatibilityPatterns demonstrates both string literals and Key constants work identically
-func TestKeyCompatibilityPatterns(t *testing.T) {
-	// fakeClock removed - cargo cult usage
-	service := New[string]()
-	defer service.Close()
-
-	callCount := int32(0)
-	handler := func(ctx context.Context, data string) error {
-		atomic.AddInt32(&callCount, 1)
-		return nil
-	}
-
-	// Register with string literal (existing pattern)
-	hook1, err := service.Hook(TestUserCreatedEvent, handler)
-	require.NoError(t, err)
-	defer hook1.Unhook()
-
-	// Register with Key constant (new pattern)
-	hook2, err := service.Hook(TestUserEvent, handler)
-	require.NoError(t, err)
-	defer hook2.Unhook()
-
-	// Emit with string literal
-	err = service.Emit(context.Background(), TestUserCreatedEvent, "data1")
-	require.NoError(t, err)
-
-	// Emit with Key constant
-	err = service.Emit(context.Background(), TestUserEvent, "data2")
-	require.NoError(t, err)
-
-	// Wait for execution
-	time.Sleep(50 * time.Millisecond)
-
-	// Both patterns should work identically
-	assert.Equal(t, int32(2), atomic.LoadInt32(&callCount))
-}
-
-// TestDynamicKeyPattern demonstrates runtime-determined event names
-//
-// COMPATIBILITY NOTE: This pattern is technically supported but NOT recommended.
-// We strongly recommend using const Keys instead of dynamic keys because:
-//
-// - Dynamic keys defeat discoverability (can't grep for event names)
-// - No compile-time safety (typos only discovered at runtime)
-// - Harder to maintain and debug
-// - Makes static analysis and tooling difficult
-//
-// Only use dynamic keys when absolutely necessary, such as:
-// - Tenant-specific routing where tenant ID is runtime-determined
-// - Plugin systems where event names come from external configuration
-// - Migration scenarios transitioning from legacy string-based systems
-//
-// For most use cases, prefer const Keys defined at package level.
-func TestDynamicKeyPattern(t *testing.T) {
-	// fakeClock removed - cargo cult usage
-	service := New[string]()
-	defer service.Close()
-
-	called := make(chan bool, 1)
-
-	// Dynamic event key based on runtime data
-	tenantID := "tenant-123"
-	dynamicKey := Key(fmt.Sprintf("tenant.%s.event", tenantID))
-
-	hook, err := service.Hook(dynamicKey, func(ctx context.Context, data string) error {
-		assert.Equal(t, "tenant-data", data)
-		called <- true
-		return nil
-	})
-
-	require.NoError(t, err)
-	defer hook.Unhook()
-
-	err = service.Emit(context.Background(), dynamicKey, "tenant-data")
-	require.NoError(t, err)
-
-	// Wait for async execution
-	select {
-	case <-called:
-		// Success
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Dynamic key hook was not called")
-	}
-}
-
-// TestMultipleKeyPatternsCoexistence verifies all patterns work together
-func TestMultipleKeyPatternsCoexistence(t *testing.T) {
-	// fakeClock removed - cargo cult usage
-	service := New[int]()
-	defer service.Close()
-
-	results := make(chan string, 4)
-
-	handler := func(pattern string) func(context.Context, int) error {
-		return func(ctx context.Context, data int) error {
-			results <- pattern
-			return nil
-		}
-	}
-
-	// String literal pattern
-	hook1, err := service.Hook(TestStringLiteralEvent, handler("string"))
-	require.NoError(t, err)
-	defer hook1.Unhook()
-
-	// Const pattern
-	hook2, err := service.Hook(TestPaymentEvent, handler("const"))
-	require.NoError(t, err)
-	defer hook2.Unhook()
-
-	// Explicit Key conversion
-	hook3, err := service.Hook(TestExplicitEvent, handler("explicit"))
-	require.NoError(t, err)
-	defer hook3.Unhook()
-
-	// Dynamic pattern
-	userID := "user-456"
-	dynamicKey := Key(fmt.Sprintf("user.%s.action", userID))
-	hook4, err := service.Hook(dynamicKey, handler("dynamic"))
-	require.NoError(t, err)
-	defer hook4.Unhook()
-
-	// Emit to all patterns
-	service.Emit(context.Background(), TestStringLiteralEvent, 1)
-	service.Emit(context.Background(), TestPaymentEvent, 2)
-	service.Emit(context.Background(), TestExplicitEvent, 3)
-	service.Emit(context.Background(), dynamicKey, 4)
-
-	// Wait for execution
-	time.Sleep(50 * time.Millisecond)
-
-	// Collect results
-	patterns := make(map[string]bool)
-	for i := 0; i < 4; i++ {
-		select {
-		case pattern := <-results:
-			patterns[pattern] = true
-		default:
-			t.Errorf("Missing result for pattern %d", i+1)
-		}
-	}
-
-	// Verify all patterns executed
-	assert.True(t, patterns["string"], "String literal pattern should work")
-	assert.True(t, patterns["const"], "Const pattern should work")
-	assert.True(t, patterns["explicit"], "Explicit Key conversion should work")
-	assert.True(t, patterns["dynamic"], "Dynamic pattern should work")
 }

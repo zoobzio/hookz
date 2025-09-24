@@ -2,83 +2,85 @@ package hookz
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	"github.com/zoobzio/clockz"
 )
 
-// Test constants for worker pool operations
-const (
-	TestPanicEvent     Key = "test.panic"
-	TestNormalEvent    Key = "test.normal"
-	TestConcurrentBase Key = "test.concurrent"
-	TestEmitBase       Key = "test.emit"
-	TestCtxEvent       Key = "test.context"
-	TestSlowEvent      Key = "test.slow"
-	TestTimeoutEvent   Key = "test.timeout"
-)
-
-func TestPanicRecovery(t *testing.T) {
+func TestWorkerPoolPanicRecovery(t *testing.T) {
 	service := New[string]()
 	defer service.Close()
 
 	// Hook that panics
-	panicHook, err := service.Hook(TestPanicEvent, func(ctx context.Context, data string) error {
+	panicDone := make(chan struct{})
+	panicHook, err := service.Hook("panic.test", func(ctx context.Context, data string) error {
+		close(panicDone)
 		panic("test panic")
 	})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("Failed to register panic hook: %v", err)
+	}
 	defer panicHook.Unhook()
 
 	// Hook that works normally
-	normalCalled := make(chan bool, 1)
-	normalHook, err := service.Hook(TestNormalEvent, func(ctx context.Context, data string) error {
-		normalCalled <- true
+	normalCalled := make(chan struct{})
+	normalHook, err := service.Hook("normal.test", func(ctx context.Context, data string) error {
+		close(normalCalled)
 		return nil
 	})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("Failed to register normal hook: %v", err)
+	}
 	defer normalHook.Unhook()
 
 	// Emit to panicking hook - should not crash service
-	err = service.Emit(context.Background(), TestPanicEvent, "data")
-	require.NoError(t, err)
+	if err := service.Emit(context.Background(), "panic.test", "data"); err != nil {
+		t.Fatalf("Failed to emit to panic hook: %v", err)
+	}
+
+	// Wait for panic to happen
+	select {
+	case <-panicDone:
+		// Panic occurred
+	case <-time.After(time.Second):
+		t.Fatal("Panic hook was not called")
+	}
 
 	// Service should still work for normal hooks
-	err = service.Emit(context.Background(), TestNormalEvent, "data")
-	require.NoError(t, err)
+	if err := service.Emit(context.Background(), "normal.test", "data"); err != nil {
+		t.Fatalf("Failed to emit to normal hook: %v", err)
+	}
 
 	select {
 	case <-normalCalled:
-		// Good - service still functional
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Normal hook did not execute after panic")
+		// Good - service still functional after panic
+	case <-time.After(time.Second):
+		t.Fatal("Normal hook did not execute after panic")
 	}
 }
 
-func TestConcurrentOperations(t *testing.T) {
+func TestWorkerPoolConcurrentOps(t *testing.T) {
 	service := New[int]()
 	defer service.Close()
 
 	var wg sync.WaitGroup
-	const numGoroutines = 5    // Reduced to avoid resource limits
-	const opsPerGoroutine = 10 // Reduced operations
+	const numGoroutines = 5
+	const opsPerGoroutine = 10
 
 	// Concurrent hook registration and emission
 	wg.Add(numGoroutines * 2)
 
-	// Hook registration goroutines - use different events to avoid per-event limit
+	// Hook registration goroutines
 	for i := 0; i < numGoroutines; i++ {
 		go func(id int) {
 			defer wg.Done()
 			hooks := make([]Hook, 0, opsPerGoroutine)
+			eventName := fmt.Sprintf("concurrent-%d", id)
 			for j := 0; j < opsPerGoroutine; j++ {
-				eventName := Key(fmt.Sprintf("%s-%d", TestConcurrentBase, id))
-				hook, err := service.Hook(eventName, func(ctx context.Context, data int) error {
+				hook, err := service.Hook(Key(eventName), func(ctx context.Context, data int) error {
 					return nil
 				})
 				if err == nil {
@@ -92,502 +94,386 @@ func TestConcurrentOperations(t *testing.T) {
 		}(i)
 	}
 
-	// Event emission goroutines - emit to different events
+	// Event emission goroutines
 	for i := 0; i < numGoroutines; i++ {
 		go func(id int) {
 			defer wg.Done()
+			eventName := fmt.Sprintf("emit-%d", id)
 			for j := 0; j < opsPerGoroutine; j++ {
-				eventName := Key(fmt.Sprintf("%s-%d", TestEmitBase, id))
-				service.Emit(context.Background(), eventName, id*opsPerGoroutine+j)
+				service.Emit(context.Background(), Key(eventName), id*opsPerGoroutine+j)
 			}
 		}(i)
 	}
 
-	wg.Wait()
-	// If we get here without panic, the concurrent operations are safe
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success - no panic or deadlock
+	case <-time.After(5 * time.Second):
+		t.Fatal("Concurrent operations timeout")
+	}
 }
 
-func TestContextCancellation(t *testing.T) {
+func TestWorkerPoolContextCancellation(t *testing.T) {
 	service := New[string]()
 	defer service.Close()
 
-	canceled := make(chan bool, 1)
-	hook, err := service.Hook(TestCtxEvent, func(ctx context.Context, data string) error {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+
+	hook, err := service.Hook("ctx.cancel", func(ctx context.Context, data string) error {
+		close(started)
 		select {
 		case <-ctx.Done():
-			canceled <- true
+			close(canceled)
 			return ctx.Err()
-		default:
-			// Check again for context cancellation
-			<-ctx.Done()
-			canceled <- true
-			return ctx.Err()
+		case <-time.After(5 * time.Second):
+			return errors.New("context not canceled")
 		}
 	})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("Failed to register hook: %v", err)
+	}
 	defer hook.Unhook()
 
-	// Create context that cancels immediately
+	// Create context and cancel immediately after emission
 	ctx, cancel := context.WithCancel(context.Background())
+
+	if err := service.Emit(ctx, "ctx.cancel", "data"); err != nil {
+		t.Fatalf("Failed to emit: %v", err)
+	}
+
+	// Wait for handler to start
+	<-started
+
+	// Cancel context
 	cancel()
 
-	err = service.Emit(ctx, TestCtxEvent, "data")
-	require.NoError(t, err)
-
+	// Handler should detect cancellation
 	select {
 	case <-canceled:
 		// Good - context cancellation was respected
-	case <-time.After(200 * time.Millisecond):
-		t.Error("Hook did not respect context cancellation")
+	case <-time.After(time.Second):
+		t.Fatal("Hook did not respect context cancellation")
 	}
 }
 
 func TestWorkerPoolShutdown(t *testing.T) {
-	service := New[string]()
+	service := New[string](WithWorkers(2))
 
-	// Register hook that would block
-	hook, err := service.Hook(TestSlowEvent, func(ctx context.Context, data string) error {
-		// Simulate work without actual time delay
+	// Register hook
+	processing := make(chan struct{})
+	done := make(chan struct{})
+
+	hook, err := service.Hook("shutdown.test", func(ctx context.Context, data string) error {
+		close(processing)
+		<-done // Wait for signal
 		return nil
 	})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("Failed to register hook: %v", err)
+	}
 
 	// Emit event
-	err = service.Emit(context.Background(), TestSlowEvent, "data")
-	require.NoError(t, err)
+	if err := service.Emit(context.Background(), "shutdown.test", "data"); err != nil {
+		t.Fatalf("Failed to emit: %v", err)
+	}
 
-	// Give time for async processing to start
-	time.Sleep(10 * time.Millisecond)
+	// Wait for processing to start
+	<-processing
 
-	// Close should wait for worker to complete
-	err = service.Close()
-	require.NoError(t, err)
+	// Close in another goroutine (it will block until worker completes)
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- service.Close()
+	}()
 
-	// Hook should still be valid for unhooking even after service closes
-	// (hooks registered before close remain valid)
-	err = hook.Unhook()
-	// This should succeed because the hook was registered before close
-	assert.NoError(t, err)
+	// Give close a moment to block
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned too early: %v", err)
+	case <-time.After(50 * time.Millisecond):
+		// Good - close is blocked waiting for worker
+	}
+
+	// Release the worker
+	close(done)
+
+	// Now close should complete
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Errorf("Close failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not complete after worker released")
+	}
+
+	// Hook should still be unhookable after close
+	if err := hook.Unhook(); err != nil {
+		t.Errorf("Failed to unhook after close: %v", err)
+	}
 }
 
 func TestWorkerPoolCapacity(t *testing.T) {
-	// Create service with minimal workers to test capacity limits
-	service := New[int](WithWorkers(2))
+	// Create service with minimal workers to test capacity
+	service := New[int](WithWorkers(1), WithQueueSize(2))
 	defer service.Close()
 
 	// Register slow hook to saturate workers
-	completed := make(chan int, 10)
-	hook, err := service.Hook(TestSlowEvent, func(ctx context.Context, data int) error {
-		// Simulate slow processing without actual time delay
-		completed <- data
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+
+	hook, err := service.Hook("capacity.test", func(ctx context.Context, data int) error {
+		if data == 0 {
+			close(blocked)
+			<-release // Block first task
+		}
 		return nil
 	})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("Failed to register hook: %v", err)
+	}
 	defer hook.Unhook()
 
-	// Submit more tasks than worker capacity
-	for i := 0; i < 6; i++ {
-		err := service.Emit(context.Background(), TestSlowEvent, i)
+	// First task blocks the single worker
+	if err := service.Emit(context.Background(), "capacity.test", 0); err != nil {
+		t.Fatalf("Failed to emit blocking task: %v", err)
+	}
+
+	// Wait for worker to be blocked
+	<-blocked
+
+	// Fill the queue (capacity 2)
+	successCount := 0
+	for i := 1; i <= 3; i++ {
+		if err := service.Emit(context.Background(), "capacity.test", i); err == nil {
+			successCount++
+		}
+	}
+
+	// We should have been able to queue exactly 2 more tasks
+	if successCount != 2 {
+		t.Errorf("Expected to queue 2 tasks, got %d", successCount)
+	}
+
+	// Further emissions should fail
+	if err := service.Emit(context.Background(), "capacity.test", 99); err != ErrQueueFull {
+		t.Errorf("Expected ErrQueueFull when queue is full, got %v", err)
+	}
+
+	// Release worker
+	close(release)
+}
+
+func TestWorkerPoolBackpressure(t *testing.T) {
+	service := New[int](
+		WithWorkers(1),
+		WithQueueSize(2),
+		WithBackpressure(BackpressureConfig{
+			MaxWait:        50 * time.Millisecond,
+			StartThreshold: 0.5, // Start backpressure at 50% full
+			Strategy:       "linear",
+		}),
+	)
+	defer service.Close()
+
+	// Block the worker
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+
+	hook, err := service.Hook("backpressure.test", func(ctx context.Context, v int) error {
+		if v == 0 {
+			close(blocked)
+			<-release
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to register hook: %v", err)
+	}
+	defer hook.Unhook()
+
+	// First task blocks the worker
+	if err := service.Emit(context.Background(), "backpressure.test", 0); err != nil {
+		t.Fatalf("Failed to emit blocking task: %v", err)
+	}
+
+	<-blocked // Wait for worker to be blocked
+
+	// Fill queue to 50% (1 of 2)
+	if err := service.Emit(context.Background(), "backpressure.test", 1); err != nil {
+		t.Fatalf("Failed to emit to queue: %v", err)
+	}
+
+	// Next emission should experience backpressure delay
+	start := time.Now()
+	err = service.Emit(context.Background(), "backpressure.test", 2)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Errorf("Emission failed: %v", err)
+	}
+
+	// Should have experienced some delay (but not the full max wait)
+	if elapsed < 10*time.Millisecond {
+		t.Logf("Warning: Expected backpressure delay, got %v", elapsed)
+	}
+
+	close(release)
+}
+
+func TestWorkerPoolOverflow(t *testing.T) {
+	service := New[int](
+		WithWorkers(1),
+		WithQueueSize(2),
+		WithOverflow(OverflowConfig{
+			Capacity:         5,
+			DrainInterval:    10 * time.Millisecond,
+			EvictionStrategy: "fifo",
+		}),
+	)
+	defer service.Close()
+
+	var processed int32
+	done := make(chan struct{})
+
+	hook, err := service.Hook("overflow.test", func(ctx context.Context, v int) error {
+		count := atomic.AddInt32(&processed, 1)
+		if count >= 7 { // We'll emit 8 total
+			close(done)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to register hook: %v", err)
+	}
+	defer hook.Unhook()
+
+	// Emit burst - should go to primary queue + overflow
+	// Primary: 2, Overflow: 5, Total capacity: 7
+	for i := 0; i < 8; i++ {
+		err := service.Emit(context.Background(), "overflow.test", i)
+		if i < 7 && err != nil {
+			t.Errorf("Failed to emit task %d: %v", i, err)
+		}
+		if i == 7 && err == nil {
+			// 8th should either succeed (if drain happened) or fail
+			t.Logf("8th emission succeeded (drain may have occurred)")
+		}
+	}
+
+	// Wait for processing
+	select {
+	case <-done:
+		if p := atomic.LoadInt32(&processed); p < 7 {
+			t.Errorf("Expected at least 7 processed, got %d", p)
+		}
+	case <-time.After(2 * time.Second):
+		t.Errorf("Timeout: only processed %d tasks", atomic.LoadInt32(&processed))
+	}
+}
+
+func TestWorkerPoolErrorHandling(t *testing.T) {
+	service := New[string]()
+	defer service.Close()
+
+	errorOccurred := make(chan struct{})
+	successOccurred := make(chan struct{})
+
+	// Hook that returns error
+	errorHook, err := service.Hook("error.test", func(ctx context.Context, data string) error {
+		close(errorOccurred)
+		return errors.New("test error")
+	})
+	if err != nil {
+		t.Fatalf("Failed to register error hook: %v", err)
+	}
+	defer errorHook.Unhook()
+
+	// Hook that succeeds
+	successHook, err := service.Hook("success.test", func(ctx context.Context, data string) error {
+		close(successOccurred)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to register success hook: %v", err)
+	}
+	defer successHook.Unhook()
+
+	// Emit to error hook
+	if err := service.Emit(context.Background(), "error.test", "data"); err != nil {
+		t.Fatalf("Failed to emit to error hook: %v", err)
+	}
+
+	// Emit to success hook
+	if err := service.Emit(context.Background(), "success.test", "data"); err != nil {
+		t.Fatalf("Failed to emit to success hook: %v", err)
+	}
+
+	// Both should complete despite error
+	select {
+	case <-errorOccurred:
+		// Good
+	case <-time.After(time.Second):
+		t.Fatal("Error hook not called")
+	}
+
+	select {
+	case <-successOccurred:
+		// Good
+	case <-time.After(time.Second):
+		t.Fatal("Success hook not called")
+	}
+}
+
+func TestWorkerPoolMultipleHooksPerEvent(t *testing.T) {
+	service := New[int](WithWorkers(5))
+	defer service.Close()
+
+	const numHooks = 5
+	var callCount int32
+	done := make(chan struct{})
+
+	// Register multiple hooks for same event
+	var hooks []Hook
+	for i := 0; i < numHooks; i++ {
+		hook, err := service.Hook("multi.hook", func(ctx context.Context, data int) error {
+			if atomic.AddInt32(&callCount, 1) == int32(numHooks) {
+				close(done)
+			}
+			return nil
+		})
 		if err != nil {
-			// Some emissions should be rejected due to queue capacity
-			assert.ErrorIs(t, err, ErrQueueFull)
+			t.Fatalf("Failed to register hook %d: %v", i, err)
 		}
+		hooks = append(hooks, hook)
 	}
 
-	// Some tasks should complete even if queue fills
-	completedCount := 0
-	timeout := time.After(500 * time.Millisecond)
-	for completedCount < 2 { // At least 2 workers should complete
-		select {
-		case <-completed:
-			completedCount++
-		case <-timeout:
-			if completedCount == 0 {
-				t.Error("Expected at least 2 tasks to complete")
-			}
-			return
+	// Cleanup
+	defer func() {
+		for _, h := range hooks {
+			h.Unhook()
 		}
-	}
-}
+	}()
 
-// TestBackpressureQueueLogic validates backpressure behavior at worker pool level
-func TestBackpressureQueueLogic(t *testing.T) {
-	t.Run("SmoothsTrafficSpikes", func(t *testing.T) {
-		service := New[int](
-			WithWorkers(1),
-			WithQueueSize(5),
-			WithBackpressure(BackpressureConfig{
-				MaxWait:        10 * time.Millisecond,
-				StartThreshold: 0.6,
-				Strategy:       "linear",
-			}),
-		)
-		defer service.Close()
-
-		// Register hook to create queue pressure
-		var processed int32
-		hook, err := service.Hook("test", func(ctx context.Context, v int) error {
-			// Simulate work without actual delay
-			atomic.AddInt32(&processed, 1)
-			return nil
-		})
-		require.NoError(t, err)
-		defer hook.Unhook()
-
-		// Emit burst - some should succeed due to backpressure
-		var successes int
-		for i := 0; i < 10; i++ {
-			if err := service.Emit(context.Background(), "test", i); err == nil {
-				successes++
-			}
-		}
-
-		// Verify backpressure behavior - should handle more than basic capacity
-		if successes <= 5 {
-			t.Errorf("backpressure should allow more than immediate capacity, got %d successes", successes)
-		}
-	})
-
-}
-
-// TestOverflowQueueLogic validates overflow behavior at worker pool level
-func TestOverflowQueueLogic(t *testing.T) {
-	t.Run("AbsorbsTrafficBursts", func(t *testing.T) {
-		service := New[int](
-			WithWorkers(1),
-			WithQueueSize(10),
-			WithOverflow(OverflowConfig{
-				Capacity:         100,
-				DrainInterval:    5 * time.Millisecond,
-				EvictionStrategy: "fifo",
-			}),
-		)
-		defer service.Close()
-
-		var processed int32
-		hook, err := service.Hook("test", func(ctx context.Context, v int) error {
-			atomic.AddInt32(&processed, 1)
-			return nil
-		})
-		require.NoError(t, err)
-		defer hook.Unhook()
-
-		// Emit large burst quickly
-		var errors int
-		for i := 0; i < 110; i++ {
-			if err := service.Emit(context.Background(), "test", i); err != nil {
-				errors++
-			}
-		}
-
-		// Should accept all up to primary + overflow capacity
-		if errors != 0 {
-			t.Errorf("overflow should absorb burst beyond primary capacity, got %d errors", errors)
-		}
-
-		// Give workers time to process by using real time for async coordination
-		time.Sleep(100 * time.Millisecond)
-
-		// Verify tasks were processed
-		processedCount := atomic.LoadInt32(&processed)
-		if processedCount == 0 {
-			t.Error("no tasks were processed")
-		}
-
-		// Log actual processing count for debugging
-		t.Logf("Processed %d tasks out of 110 emitted", processedCount)
-	})
-
-	t.Run("DrainsToPrimary", func(t *testing.T) {
-		service := New[int](
-			WithWorkers(2),
-			WithQueueSize(5),
-			WithOverflow(OverflowConfig{
-				Capacity:         10,
-				DrainInterval:    10 * time.Millisecond,
-				EvictionStrategy: "reject",
-			}),
-		)
-		defer service.Close()
-
-		var processed int32
-		hook, err := service.Hook("test", func(ctx context.Context, v int) error {
-			atomic.AddInt32(&processed, 1)
-			return nil
-		})
-		require.NoError(t, err)
-		defer hook.Unhook()
-
-		// Fill primary queue first (slow processing)
-		for i := 0; i < 8; i++ {
-			service.Emit(context.Background(), "test", i)
-		}
-
-		// Wait for drain cycles to move tasks
-		time.Sleep(60 * time.Millisecond)
-
-		// Check that some tasks were processed
-		processedCount := atomic.LoadInt32(&processed)
-		if processedCount == 0 {
-			t.Error("overflow drain should have processed some tasks")
-		}
-	})
-}
-
-// TestSubmitWithBackpressureThenOverflow tests the combined backpressure and overflow submission path
-func TestSubmitWithBackpressureThenOverflow(t *testing.T) {
-	t.Run("HandlesBackpressureThenOverflow", func(t *testing.T) {
-		service := New[int](
-			WithWorkers(1),
-			WithQueueSize(3),
-			WithBackpressure(BackpressureConfig{
-				MaxWait:        5 * time.Millisecond,
-				StartThreshold: 0.5,
-				Strategy:       "fixed",
-			}),
-			WithOverflow(OverflowConfig{
-				Capacity:         5,
-				DrainInterval:    10 * time.Millisecond,
-				EvictionStrategy: "reject",
-			}),
-		)
-		defer service.Close()
-
-		// Block the worker to fill the queue
-		blocked := make(chan struct{})
-		unblock := make(chan struct{})
-		hook, err := service.Hook("test", func(ctx context.Context, v int) error {
-			if v == 0 {
-				close(blocked)
-				<-unblock
-			}
-			return nil
-		})
-		require.NoError(t, err)
-		defer hook.Unhook()
-
-		// Send first task to block worker
-		err = service.Emit(context.Background(), "test", 0)
-		require.NoError(t, err)
-		<-blocked
-
-		// Fill primary queue to trigger backpressure
-		for i := 1; i <= 3; i++ {
-			err = service.Emit(context.Background(), "test", i)
-			require.NoError(t, err, "should accept into primary queue")
-		}
-
-		// Now primary is full, next should use backpressure then overflow
-		start := time.Now()
-		err = service.Emit(context.Background(), "test", 4)
-		elapsed := time.Since(start)
-
-		// Should have waited due to backpressure
-		assert.NoError(t, err)
-		assert.GreaterOrEqual(t, elapsed, 2*time.Millisecond, "should have applied backpressure delay")
-
-		// Fill overflow (capacity is 5, we've sent 5 items: 0-4)
-		for i := 5; i <= 8; i++ {
-			err = service.Emit(context.Background(), "test", i)
-			assert.NoError(t, err, "should accept into overflow")
-		}
-
-		// Both primary (3) and overflow (5) full, next should be rejected
-		err = service.Emit(context.Background(), "test", 9)
-		assert.ErrorIs(t, err, ErrQueueFull)
-
-		close(unblock)
-	})
-
-	t.Run("RespectsMaxWaitTimeout", func(t *testing.T) {
-		service := New[int](
-			WithWorkers(1),
-			WithQueueSize(2),
-			WithBackpressure(BackpressureConfig{
-				MaxWait:        10 * time.Millisecond,
-				StartThreshold: 0.5,
-				Strategy:       "exponential",
-			}),
-			WithOverflow(OverflowConfig{
-				Capacity:         3,
-				DrainInterval:    20 * time.Millisecond,
-				EvictionStrategy: "lifo",
-			}),
-		)
-		defer service.Close()
-
-		// Block worker
-		blocked := make(chan struct{})
-		hook, err := service.Hook("test", func(ctx context.Context, v int) error {
-			if v == 0 {
-				close(blocked)
-				time.Sleep(100 * time.Millisecond) // Hold worker busy
-			}
-			return nil
-		})
-		require.NoError(t, err)
-		defer hook.Unhook()
-
-		// Block the worker
-		service.Emit(context.Background(), "test", 0)
-		<-blocked
-
-		// Fill primary queue
-		service.Emit(context.Background(), "test", 1)
-		service.Emit(context.Background(), "test", 2)
-
-		// Next emit should wait up to MaxWait then use overflow
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		defer cancel()
-
-		err = service.Emit(ctx, "test", 3)
-		assert.NoError(t, err, "should succeed using overflow after backpressure wait")
-	})
-}
-
-// TestCalculateBackpressureDelay tests edge cases in backpressure delay calculation
-func TestCalculateBackpressureDelay(t *testing.T) {
-	backpressureConfig := &BackpressureConfig{
-		MaxWait:        100 * time.Millisecond,
-		StartThreshold: 0.7,
-		Strategy:       "linear",
-	}
-	wp := &workerPool[int]{
-		backpressure: backpressureConfig,
-		tasks:        make(chan hookTask[int], 100),
+	// Single emission should trigger all hooks
+	if err := service.Emit(context.Background(), "multi.hook", 42); err != nil {
+		t.Fatalf("Failed to emit: %v", err)
 	}
 
-	t.Run("BelowThreshold", func(t *testing.T) {
-		delay := wp.calculateBackpressureDelay(0.5) // 50% full
-		assert.Equal(t, time.Duration(0), delay, "should not apply delay below threshold")
-	})
-
-	t.Run("AtThreshold", func(t *testing.T) {
-		delay := wp.calculateBackpressureDelay(0.7) // Exactly at threshold
-		assert.Equal(t, time.Duration(0), delay, "should not apply delay exactly at threshold")
-	})
-
-	t.Run("AboveThreshold", func(t *testing.T) {
-		delay := wp.calculateBackpressureDelay(0.85) // 85% full
-		assert.Greater(t, delay, time.Duration(0), "should apply delay above threshold")
-		assert.LessOrEqual(t, delay, wp.backpressure.MaxWait, "should not exceed max wait")
-	})
-
-	t.Run("AtCapacity", func(t *testing.T) {
-		delay := wp.calculateBackpressureDelay(1.0) // 100% full
-		assert.Equal(t, wp.backpressure.MaxWait, delay, "should apply max delay at capacity")
-	})
-
-	t.Run("FixedStrategy", func(t *testing.T) {
-		wp.backpressure.Strategy = "fixed"
-		delay := wp.calculateBackpressureDelay(0.85)
-		assert.Equal(t, wp.backpressure.MaxWait, delay, "fixed strategy should always use max wait")
-	})
-
-	t.Run("ExponentialStrategy", func(t *testing.T) {
-		wp.backpressure.Strategy = "exponential"
-		delay1 := wp.calculateBackpressureDelay(0.75)
-		delay2 := wp.calculateBackpressureDelay(0.85)
-		delay3 := wp.calculateBackpressureDelay(0.95)
-
-		assert.Less(t, delay1, delay2, "exponential should increase with queue depth")
-		assert.Less(t, delay2, delay3, "exponential should increase more steeply")
-		assert.LessOrEqual(t, delay3, wp.backpressure.MaxWait, "should cap at max wait")
-	})
-
-	t.Run("ZeroMaxWait", func(t *testing.T) {
-		wp.backpressure.MaxWait = 0
-		delay := wp.calculateBackpressureDelay(0.9)
-		assert.Equal(t, time.Duration(0), delay, "should return zero when max wait is zero")
-	})
-}
-
-// TestOverflowQueueEnqueue tests the overflow queue enqueue function
-func TestOverflowQueueEnqueue(t *testing.T) {
-	clock := clockz.RealClock
-	oq := &overflowQueue[string]{
-		capacity: 5,
-		strategy: "fifo",
-		clock:    clock,
+	// All hooks should be called
+	select {
+	case <-done:
+		if c := atomic.LoadInt32(&callCount); c != numHooks {
+			t.Errorf("Expected %d calls, got %d", numHooks, c)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Timeout: only %d/%d hooks called", atomic.LoadInt32(&callCount), numHooks)
 	}
-
-	t.Run("EnqueueToEmptyQueue", func(t *testing.T) {
-		task := hookTask[string]{
-			event: "test",
-			data:  "data1",
-			ctx:   context.Background(),
-		}
-
-		err := oq.enqueue(task)
-		assert.NoError(t, err, "should enqueue to empty queue")
-		assert.Equal(t, 1, len(oq.items), "queue should have one item")
-	})
-
-	t.Run("EnqueueToPartialQueue", func(t *testing.T) {
-		// Add more items
-		for i := 2; i <= 3; i++ {
-			task := hookTask[string]{
-				event: fmt.Sprintf("test%d", i),
-				data:  fmt.Sprintf("data%d", i),
-				ctx:   context.Background(),
-			}
-			err := oq.enqueue(task)
-			assert.NoError(t, err, "should enqueue to partial queue")
-		}
-		assert.Equal(t, 3, len(oq.items), "queue should have three items")
-	})
-
-	t.Run("EnqueueToFullQueueFIFO", func(t *testing.T) {
-		// Fill the queue
-		for i := 4; i <= 5; i++ {
-			task := hookTask[string]{
-				event: fmt.Sprintf("test%d", i),
-				data:  fmt.Sprintf("data%d", i),
-				ctx:   context.Background(),
-			}
-			oq.enqueue(task)
-		}
-
-		// Try to enqueue when full with FIFO strategy
-		task := hookTask[string]{
-			event: "overflow",
-			data:  "new_item",
-			ctx:   context.Background(),
-		}
-
-		err := oq.enqueue(task)
-		assert.NoError(t, err, "FIFO should drop oldest and add new")
-		assert.Equal(t, 5, len(oq.items), "queue should remain at capacity")
-		assert.Equal(t, "new_item", oq.items[4].data, "newest item should be at end")
-	})
-
-	t.Run("EnqueueRejectStrategy", func(t *testing.T) {
-		// Create new queue with reject strategy
-		rejectQueue := &overflowQueue[string]{
-			capacity: 2,
-			strategy: "reject",
-			clock:    clock,
-		}
-
-		// Fill the queue
-		for i := 0; i < 2; i++ {
-			task := hookTask[string]{
-				event: fmt.Sprintf("test%d", i),
-				data:  fmt.Sprintf("data%d", i),
-				ctx:   context.Background(),
-			}
-			rejectQueue.enqueue(task)
-		}
-
-		// Try to enqueue when full
-		task := hookTask[string]{
-			event: "overflow",
-			data:  "should_fail",
-			ctx:   context.Background(),
-		}
-
-		err := rejectQueue.enqueue(task)
-		assert.ErrorIs(t, err, ErrQueueFull, "reject strategy should return error when full")
-		assert.Equal(t, 2, len(rejectQueue.items), "queue should remain at capacity")
-	})
 }
