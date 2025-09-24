@@ -8,6 +8,45 @@ import (
 	"time"
 )
 
+// waitForMetric polls a metric value until it reaches the expected value or times out.
+// This is used to handle the async nature of metric updates in the worker pool.
+func waitForMetric[T any](t *testing.T, service *Hooks[T], getMetric func(*Metrics) int64, expected int64, name string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		metrics := service.Metrics()
+		if getMetric(&metrics) == expected {
+			return // Success
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("Timeout waiting for %s: expected %d, got %d", name, expected, getMetric(&metrics))
+			return
+		}
+	}
+}
+
+// waitForCondition polls until a condition is met or times out.
+// This is more general than waitForMetric and can be used for complex conditions.
+func waitForCondition(t *testing.T, timeout time.Duration, check func() bool, failMessage string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if check() {
+			return // Success
+		}
+		if time.Now().After(deadline) {
+			t.Error(failMessage)
+			return
+		}
+	}
+}
+
 func TestMetricsStructure(t *testing.T) {
 	service := New[string]()
 	defer service.Close()
@@ -137,11 +176,11 @@ func TestMetricsTasksProcessed(t *testing.T) {
 		}
 	}
 
-	// Check metrics
+	// Wait for metrics to reflect all processed tasks
+	waitForMetric(t, service, func(m *Metrics) int64 { return m.TasksProcessed }, int64(numTasks), "TasksProcessed")
+
+	// Verify final metrics
 	metrics := service.Metrics()
-	if metrics.TasksProcessed != int64(numTasks) {
-		t.Errorf("Expected %d TasksProcessed, got %d", numTasks, metrics.TasksProcessed)
-	}
 	if metrics.TasksFailed != 0 {
 		t.Errorf("Expected 0 TasksFailed, got %d", metrics.TasksFailed)
 	}
@@ -181,14 +220,11 @@ func TestMetricsTasksFailed(t *testing.T) {
 		}
 	}
 
-	// Give a small delay for metrics to be updated after handler completion
-	time.Sleep(10 * time.Millisecond)
+	// Wait for metrics to reflect all failed tasks
+	waitForMetric(t, service, func(m *Metrics) int64 { return m.TasksFailed }, int64(numTasks), "TasksFailed")
 
-	// Check metrics - allow for timing variations
+	// Verify final metrics
 	metrics := service.Metrics()
-	if metrics.TasksFailed < int64(numTasks-1) || metrics.TasksFailed > int64(numTasks) {
-		t.Errorf("Expected around %d TasksFailed, got %d", numTasks, metrics.TasksFailed)
-	}
 	if metrics.TasksProcessed != 0 {
 		t.Errorf("Expected 0 TasksProcessed, got %d", metrics.TasksProcessed)
 	}
@@ -335,14 +371,8 @@ func TestMetricsQueueDepth(t *testing.T) {
 	// Release worker to process queued tasks
 	close(release)
 
-	// Give time for queue to drain
-	time.Sleep(50 * time.Millisecond)
-
-	// Final depth should be 0
-	metrics = service.Metrics()
-	if metrics.QueueDepth != 0 {
-		t.Errorf("Expected QueueDepth 0 after processing, got %d", metrics.QueueDepth)
-	}
+	// Wait for queue to drain completely
+	waitForMetric(t, service, func(m *Metrics) int64 { return m.QueueDepth }, 0, "QueueDepth")
 }
 
 func TestMetricsConcurrentAccess(t *testing.T) {
@@ -433,14 +463,11 @@ func TestMetricsPanicHandling(t *testing.T) {
 		t.Fatal("Task not called")
 	}
 
-	// Give worker time to recover and update metrics
-	time.Sleep(10 * time.Millisecond)
+	// Wait for metrics to reflect the failed task (panic counts as failure)
+	waitForMetric(t, service, func(m *Metrics) int64 { return m.TasksFailed }, 1, "TasksFailed")
 
-	// Check metrics - panic should count as failure
+	// Verify final metrics
 	metrics := service.Metrics()
-	if metrics.TasksFailed != 1 {
-		t.Errorf("Expected 1 TasksFailed for panic, got %d", metrics.TasksFailed)
-	}
 	if metrics.TasksProcessed != 0 {
 		t.Errorf("Expected 0 TasksProcessed for panic, got %d", metrics.TasksProcessed)
 	}
@@ -578,8 +605,11 @@ func TestMetricsAtomicOperations(t *testing.T) {
 
 	wg.Wait()
 
-	// Give time for processing
-	time.Sleep(100 * time.Millisecond)
+	// Wait for at least some tasks to be processed
+	waitForCondition(t, 100*time.Millisecond, func() bool {
+		metrics := service.Metrics()
+		return (metrics.TasksProcessed + metrics.TasksRejected) > 0
+	}, "Expected some tasks to be processed or rejected")
 
 	// Verify metrics consistency
 	metrics := service.Metrics()
@@ -588,11 +618,6 @@ func TestMetricsAtomicOperations(t *testing.T) {
 	// Total tasks should be non-negative and reasonable
 	if totalTasks < 0 {
 		t.Errorf("Total tasks should be non-negative, got %d", totalTasks)
-	}
-
-	// Should have processed at least some tasks
-	if metrics.TasksProcessed == 0 && metrics.TasksRejected == 0 {
-		t.Error("Expected some tasks to be processed or rejected")
 	}
 
 	// Check for reasonable bounds
