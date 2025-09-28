@@ -81,4 +81,4 @@ package hookz
 //	})
 //
 //	hooks.Emit(ctx, UserCreated, newUser)
-type Key = string
+type Key string

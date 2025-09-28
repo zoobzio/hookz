@@ -51,7 +51,7 @@ type hookTask[T any] struct {
 	ctx   context.Context // Context for cancellation and timeout
 	data  T               // Event data to pass to hook
 	hook  hookEntry[T]    // Hook callback and configuration
-	event string          // Event name (for logging)
+	event Key             // Event name (for logging)
 }
 
 // hookEntry contains the callback function and its configuration.

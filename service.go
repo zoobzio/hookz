@@ -139,7 +139,7 @@ const (
 //	}
 type Hooks[T any] struct {
 	clock         clockz.Clock // Time abstraction injected at creation
-	hooks         map[string][]hookEntry[T]
+	hooks         map[Key][]hookEntry[T]
 	workers       *workerPool[T] // Lazily initialized on first hook registration
 	workerConfig  *config        // Stored config for lazy worker pool creation
 	mu            sync.RWMutex
@@ -188,7 +188,7 @@ func New[T any](opts ...Option) *Hooks[T] {
 
 	impl := &Hooks[T]{
 		clock:         cfg.clock,
-		hooks:         make(map[string][]hookEntry[T]),
+		hooks:         make(map[Key][]hookEntry[T]),
 		GlobalTimeout: cfg.timeout,
 		closed:        false,
 		totalHooks:    0,
@@ -254,7 +254,7 @@ func (h *Hooks[T]) Hook(event Key, callback func(context.Context, T) error) (Hoo
 }
 
 // removeHook safely removes a hook by ID.
-func (h *Hooks[T]) removeHook(event, id string) error {
+func (h *Hooks[T]) removeHook(event Key, id string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -305,7 +305,7 @@ func (h *Hooks[T]) ClearAll() int {
 		count += len(hooks)
 	}
 
-	h.hooks = make(map[string][]hookEntry[T])
+	h.hooks = make(map[Key][]hookEntry[T])
 	h.totalHooks = 0 // Reset total hook counter
 	return count
 }
