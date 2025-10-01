@@ -2,11 +2,14 @@ package hookz
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/zoobzio/clockz"
 )
 
 func TestServiceRaceConditionSafety(t *testing.T) {
@@ -543,4 +546,155 @@ func TestServiceConcurrentEmissions(t *testing.T) {
 		// This is acceptable - some emits may have been dropped due to queue full
 		t.Logf("Processed %d/%d emissions (some may have been dropped due to queue limits)", finalCount, totalExpected)
 	}
+}
+
+// TestServiceUncoveredPaths tests critical paths not covered by other tests
+func TestServiceUncoveredPaths(t *testing.T) {
+	t.Run("WithClock", func(t *testing.T) {
+		service := New[string](WithClock(clockz.RealClock))
+		defer service.Close()
+
+		// Test that service works with custom clock
+		done := make(chan struct{})
+		hook, err := service.Hook("clock.test", func(ctx context.Context, data string) error {
+			close(done)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to register hook: %v", err)
+		}
+		defer hook.Unhook()
+
+		if err := service.Emit(context.Background(), "clock.test", "data"); err != nil {
+			t.Fatalf("Failed to emit: %v", err)
+		}
+
+		select {
+		case <-done:
+			// Success
+		case <-time.After(time.Second):
+			t.Fatal("Hook not called")
+		}
+	})
+
+	t.Run("ServiceUnhookMethod", func(t *testing.T) {
+		service := New[string]()
+		defer service.Close()
+
+		hook, err := service.Hook("unhook.test", func(ctx context.Context, data string) error {
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to register hook: %v", err)
+		}
+
+		// Test service's Unhook method
+		if err := service.Unhook(hook); err != nil {
+			t.Fatalf("Failed to unhook via service method: %v", err)
+		}
+	})
+
+	t.Run("TotalHooksLimit", func(t *testing.T) {
+		service := New[int]()
+		defer service.Close()
+
+		// Register hooks up to the limit
+		var hooks []Hook
+		for i := 0; i < maxTotalHooks; i++ {
+			event := Key(fmt.Sprintf("event%d", i%1000)) // Spread across different events
+			hook, err := service.Hook(event, func(ctx context.Context, data int) error {
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("Failed to register hook %d: %v", i, err)
+			}
+			hooks = append(hooks, hook)
+		}
+
+		// Next hook should fail with ErrTooManyHooks
+		_, err := service.Hook("overflow", func(ctx context.Context, data int) error {
+			return nil
+		})
+		if err != ErrTooManyHooks {
+			t.Errorf("Expected ErrTooManyHooks, got %v", err)
+		}
+
+		// Cleanup
+		for _, hook := range hooks {
+			hook.Unhook()
+		}
+	})
+
+	t.Run("EmitWithNoHooksForEvent", func(t *testing.T) {
+		service := New[string]()
+		defer service.Close()
+
+		// Register hook for one event
+		hook, err := service.Hook("registered.event", func(ctx context.Context, data string) error {
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to register hook: %v", err)
+		}
+		defer hook.Unhook()
+
+		// Emit to different event (no hooks registered for this one)
+		if err := service.Emit(context.Background(), "unregistered.event", "data"); err != nil {
+			t.Fatalf("Emit to unregistered event should succeed: %v", err)
+		}
+	})
+
+	t.Run("CloseWithRemainingTasks", func(t *testing.T) {
+		service := New[string](WithWorkers(1), WithQueueSize(10))
+
+		// Block the worker
+		blocked := make(chan struct{})
+		release := make(chan struct{})
+		_, err := service.Hook("blocking.test", func(ctx context.Context, data string) error {
+			if data == "block" {
+				close(blocked)
+				<-release
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to register hook: %v", err)
+		}
+
+		// Submit blocking task
+		if err := service.Emit(context.Background(), "blocking.test", "block"); err != nil {
+			t.Fatalf("Failed to emit blocking task: %v", err)
+		}
+		<-blocked // Wait for worker to be blocked
+
+		// Fill queue with more tasks
+		for i := 0; i < 5; i++ {
+			service.Emit(context.Background(), "blocking.test", fmt.Sprintf("queued%d", i))
+		}
+
+		// Check that queue has tasks
+		metrics := service.Metrics()
+		if metrics.QueueDepth == 0 {
+			t.Error("Expected queue to have tasks")
+		}
+
+		// Close service while tasks are queued
+		closeDone := make(chan error, 1)
+		go func() {
+			closeDone <- service.Close()
+		}()
+
+		// Release the blocking task
+		close(release)
+
+		// Wait for close to complete
+		select {
+		case err := <-closeDone:
+			if err != nil {
+				t.Errorf("Close failed: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Close did not complete")
+		}
+	})
 }

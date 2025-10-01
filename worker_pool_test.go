@@ -477,3 +477,323 @@ func TestWorkerPoolMultipleHooksPerEvent(t *testing.T) {
 		t.Fatalf("Timeout: only %d/%d hooks called", atomic.LoadInt32(&callCount), numHooks)
 	}
 }
+
+// TestWorkerPoolAdvancedFeatures tests uncovered worker pool functionality
+func TestWorkerPoolAdvancedFeatures(t *testing.T) {
+	t.Run("GlobalTimeout", func(t *testing.T) {
+		service := New[string](WithWorkers(1), WithTimeout(50*time.Millisecond))
+		defer service.Close()
+
+		timedOut := make(chan struct{})
+		hook, err := service.Hook("timeout.test", func(ctx context.Context, data string) error {
+			select {
+			case <-ctx.Done():
+				close(timedOut)
+				return ctx.Err()
+			case <-time.After(200 * time.Millisecond):
+				return nil // Should not reach here
+			}
+		})
+		if err != nil {
+			t.Fatalf("Failed to register hook: %v", err)
+		}
+		defer hook.Unhook()
+
+		if err := service.Emit(context.Background(), "timeout.test", "data"); err != nil {
+			t.Fatalf("Failed to emit: %v", err)
+		}
+
+		select {
+		case <-timedOut:
+			// Good - timeout was applied
+		case <-time.After(time.Second):
+			t.Fatal("Global timeout was not applied")
+		}
+	})
+
+	t.Run("CombinedBackpressureAndOverflow", func(t *testing.T) {
+		service := New[int](
+			WithWorkers(1),
+			WithQueueSize(2),
+			WithBackpressure(BackpressureConfig{
+				MaxWait:        20 * time.Millisecond,
+				StartThreshold: 0.5,
+				Strategy:       "linear",
+			}),
+			WithOverflow(OverflowConfig{
+				Capacity:         3,
+				DrainInterval:    10 * time.Millisecond,
+				EvictionStrategy: "fifo",
+			}),
+		)
+		defer service.Close()
+
+		// Block the worker
+		blocked := make(chan struct{})
+		release := make(chan struct{})
+		hook, err := service.Hook("combined.test", func(ctx context.Context, v int) error {
+			if v == 0 {
+				close(blocked)
+				<-release
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to register hook: %v", err)
+		}
+		defer hook.Unhook()
+
+		// Block the worker
+		if err := service.Emit(context.Background(), "combined.test", 0); err != nil {
+			t.Fatalf("Failed to emit blocking task: %v", err)
+		}
+		<-blocked
+
+		// Submit burst of tasks to test backpressure then overflow
+		var successCount int
+		for i := 1; i <= 10; i++ {
+			if err := service.Emit(context.Background(), "combined.test", i); err == nil {
+				successCount++
+			}
+		}
+
+		// Should have succeeded for some tasks (primary queue + overflow)
+		if successCount < 2 {
+			t.Errorf("Expected at least 2 successful submissions, got %d", successCount)
+		}
+
+		close(release)
+	})
+
+	t.Run("OverflowEvictionStrategies", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			strategy string
+		}{
+			{"LIFO", "lifo"},
+			{"Reject", "reject"},
+			{"Default", "unknown"},
+		}
+
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				service := New[int](
+					WithWorkers(1),
+					WithQueueSize(1),
+					WithOverflow(OverflowConfig{
+						Capacity:         2,
+						DrainInterval:    time.Hour, // Don't drain during test
+						EvictionStrategy: test.strategy,
+					}),
+				)
+				defer service.Close()
+
+				// Block worker
+				blocked := make(chan struct{})
+				release := make(chan struct{})
+				hook, err := service.Hook("eviction.test", func(ctx context.Context, v int) error {
+					if v == 0 {
+						close(blocked)
+						<-release
+					}
+					return nil
+				})
+				if err != nil {
+					t.Fatalf("Failed to register hook: %v", err)
+				}
+				defer hook.Unhook()
+
+				// Block worker
+				if err := service.Emit(context.Background(), "eviction.test", 0); err != nil {
+					t.Fatalf("Failed to emit blocking task: %v", err)
+				}
+				<-blocked
+
+				// Fill primary queue + overflow
+				for i := 1; i <= 3; i++ {
+					service.Emit(context.Background(), "eviction.test", i)
+				}
+
+				// Try to overflow
+				err = service.Emit(context.Background(), "eviction.test", 99)
+				switch test.strategy {
+				case "reject", "unknown":
+					if err != ErrQueueFull {
+						t.Errorf("Expected ErrQueueFull for %s strategy, got %v", test.strategy, err)
+					}
+				case "lifo", "fifo":
+					if err != nil {
+						t.Errorf("Expected success for %s strategy, got %v", test.strategy, err)
+					}
+				}
+
+				close(release)
+			})
+		}
+	})
+
+	t.Run("WorkerPoolClosedSubmission", func(t *testing.T) {
+		service := New[string](WithWorkers(1))
+
+		// Register hook to initialize worker pool
+		hook, err := service.Hook("init.test", func(ctx context.Context, data string) error {
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to register hook: %v", err)
+		}
+		defer hook.Unhook()
+
+		// Close service
+		if err := service.Close(); err != nil {
+			t.Fatalf("Failed to close service: %v", err)
+		}
+
+		// Try to emit after close
+		if err := service.Emit(context.Background(), "closed.test", "data"); err != ErrServiceClosed {
+			t.Errorf("Expected ErrServiceClosed, got %v", err)
+		}
+	})
+
+	t.Run("BackpressureStrategies", func(t *testing.T) {
+		strategies := []string{"fixed", "linear", "exponential", "unknown"}
+
+		for _, strategy := range strategies {
+			t.Run(strategy, func(t *testing.T) {
+				service := New[int](
+					WithWorkers(1),
+					WithQueueSize(1),
+					WithBackpressure(BackpressureConfig{
+						MaxWait:        10 * time.Millisecond,
+						StartThreshold: 0.5,
+						Strategy:       strategy,
+					}),
+				)
+				defer service.Close()
+
+				// Block worker and fill queue
+				blocked := make(chan struct{})
+				release := make(chan struct{})
+				hook, err := service.Hook("strategy.test", func(ctx context.Context, v int) error {
+					if v == 0 {
+						close(blocked)
+						<-release
+					}
+					return nil
+				})
+				if err != nil {
+					t.Fatalf("Failed to register hook: %v", err)
+				}
+				defer hook.Unhook()
+
+				// Block worker
+				service.Emit(context.Background(), "strategy.test", 0)
+				<-blocked
+
+				// Fill queue
+				service.Emit(context.Background(), "strategy.test", 1)
+
+				// Test backpressure
+				start := time.Now()
+				_ = service.Emit(context.Background(), "strategy.test", 2)
+				elapsed := time.Since(start)
+
+				// Should have some delay for all strategies
+				if elapsed < time.Millisecond {
+					t.Logf("Warning: Expected some backpressure delay for %s strategy, got %v", strategy, elapsed)
+				}
+
+				close(release)
+			})
+		}
+	})
+
+	t.Run("OverflowZeroCapacity", func(t *testing.T) {
+		service := New[int](
+			WithWorkers(1),
+			WithQueueSize(1),
+			WithOverflow(OverflowConfig{
+				Capacity:         0, // Zero capacity should always reject
+				DrainInterval:    10 * time.Millisecond,
+				EvictionStrategy: "fifo",
+			}),
+		)
+		defer service.Close()
+
+		// Block worker
+		blocked := make(chan struct{})
+		release := make(chan struct{})
+		hook, err := service.Hook("zero.test", func(ctx context.Context, v int) error {
+			if v == 0 {
+				close(blocked)
+				<-release
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to register hook: %v", err)
+		}
+		defer hook.Unhook()
+
+		// Block worker
+		service.Emit(context.Background(), "zero.test", 0)
+		<-blocked
+
+		// Fill primary queue
+		service.Emit(context.Background(), "zero.test", 1)
+
+		// Next should fail due to zero overflow capacity
+		if err := service.Emit(context.Background(), "zero.test", 2); err != ErrQueueFull {
+			t.Errorf("Expected ErrQueueFull with zero overflow capacity, got %v", err)
+		}
+
+		close(release)
+	})
+
+	t.Run("OverflowContextExpiration", func(t *testing.T) {
+		service := New[int](
+			WithWorkers(1),
+			WithQueueSize(1),
+			WithOverflow(OverflowConfig{
+				Capacity:         5,
+				DrainInterval:    50 * time.Millisecond,
+				EvictionStrategy: "fifo",
+			}),
+		)
+		defer service.Close()
+
+		// Block worker
+		blocked := make(chan struct{})
+		release := make(chan struct{})
+		hook, err := service.Hook("expire.test", func(ctx context.Context, v int) error {
+			if v == 0 {
+				close(blocked)
+				<-release
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to register hook: %v", err)
+		}
+		defer hook.Unhook()
+
+		// Block worker
+		service.Emit(context.Background(), "expire.test", 0)
+		<-blocked
+
+		// Fill primary queue
+		service.Emit(context.Background(), "expire.test", 1)
+
+		// Submit task with expired context to overflow
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel immediately
+		if err := service.Emit(ctx, "expire.test", 2); err != nil {
+			t.Logf("Emit with canceled context: %v", err)
+		}
+
+		// Wait for drain to process expired task
+		time.Sleep(100 * time.Millisecond)
+
+		close(release)
+	})
+}
