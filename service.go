@@ -147,8 +147,9 @@ type Hooks[T any] struct {
 	totalHooks    int // Tracks total hook count across all events
 	closed        bool
 
-	// Metrics field - zero initialization provides safe defaults
-	metrics Metrics
+	// Metrics field - pointer to enable lazy initialization
+	// nil when no hooks registered, reducing atomic operations overhead
+	metrics *Metrics
 }
 
 // New creates a new hook service with the specified options.
@@ -204,7 +205,19 @@ func New[T any](opts ...Option) *Hooks[T] {
 // Must be called with mutex already held.
 func (h *Hooks[T]) initWorkerPool() {
 	if h.workers == nil && h.workerConfig != nil {
-		h.workers = newWorkerPoolWithResilience[T](*h.workerConfig, &h.metrics)
+		// Ensure metrics are initialized before creating worker pool
+		if h.metrics == nil {
+			h.metrics = &Metrics{}
+		}
+		h.workers = newWorkerPoolWithResilience[T](*h.workerConfig, h.metrics)
+	}
+}
+
+// initMetrics lazily initializes the metrics struct if not already created.
+// Must be called with mutex already held.
+func (h *Hooks[T]) initMetrics() {
+	if h.metrics == nil {
+		h.metrics = &Metrics{}
 	}
 }
 
@@ -229,8 +242,9 @@ func (h *Hooks[T]) Hook(event Key, callback func(context.Context, T) error) (Hoo
 		return Hook{}, ErrTooManyHooks
 	}
 
-	// Lazily initialize worker pool on first hook registration
+	// Lazily initialize worker pool and metrics on first hook registration
 	h.initWorkerPool()
+	h.initMetrics()
 
 	// Create new hook entry
 	id := h.generateID()
@@ -319,6 +333,12 @@ func (h *Hooks[T]) Emit(ctx context.Context, event Key, data T) error {
 		return ErrServiceClosed
 	}
 
+	// Fast path: if no hooks registered at all, exit early
+	if h.totalHooks == 0 {
+		h.mu.RUnlock()
+		return nil
+	}
+
 	// Copy hooks slice to prevent race conditions during iteration
 	originalHooks := h.hooks[event]
 	hooks := make([]hookEntry[T], len(originalHooks))
@@ -359,10 +379,21 @@ func (h *Hooks[T]) Emit(ctx context.Context, event Key, data T) error {
 // RegisteredHooks requires mutex acquisition for consistency with Hook/Unhook operations.
 // All counter values are read atomically for thread safety.
 func (h *Hooks[T]) Metrics() Metrics {
+	// Fast path for uninitialized metrics (no hooks registered)
+	if h.metrics == nil {
+		return Metrics{} // Return zero-value metrics
+	}
+
 	h.mu.RLock()
 	registeredHooks := int64(h.totalHooks)
 	workers := h.workers // Capture worker pool reference
+	metrics := h.metrics // Capture metrics reference
 	h.mu.RUnlock()
+
+	// Return zero metrics if not initialized
+	if metrics == nil {
+		return Metrics{}
+	}
 
 	// Calculate queue capacity - 0 if no worker pool initialized
 	var queueCapacity int64
@@ -371,12 +402,12 @@ func (h *Hooks[T]) Metrics() Metrics {
 	}
 
 	return Metrics{
-		QueueDepth:      atomic.LoadInt64(&h.metrics.QueueDepth),
+		QueueDepth:      atomic.LoadInt64(&metrics.QueueDepth),
 		QueueCapacity:   queueCapacity,
-		TasksProcessed:  atomic.LoadInt64(&h.metrics.TasksProcessed),
-		TasksRejected:   atomic.LoadInt64(&h.metrics.TasksRejected),
-		TasksFailed:     atomic.LoadInt64(&h.metrics.TasksFailed),
-		TasksExpired:    atomic.LoadInt64(&h.metrics.TasksExpired),
+		TasksProcessed:  atomic.LoadInt64(&metrics.TasksProcessed),
+		TasksRejected:   atomic.LoadInt64(&metrics.TasksRejected),
+		TasksFailed:     atomic.LoadInt64(&metrics.TasksFailed),
+		TasksExpired:    atomic.LoadInt64(&metrics.TasksExpired),
 		RegisteredHooks: registeredHooks,
 		// Overflow metrics set to 0 initially, Phase 2 implementation
 		OverflowDepth:    0,
@@ -402,10 +433,12 @@ func (h *Hooks[T]) Close() error {
 		workers.close()
 
 		// Count remaining tasks as expired for metrics consistency
-		remaining := atomic.LoadInt64(&h.metrics.QueueDepth)
-		if remaining > 0 {
-			atomic.AddInt64(&h.metrics.TasksExpired, remaining)
-			atomic.StoreInt64(&h.metrics.QueueDepth, 0)
+		if h.metrics != nil {
+			remaining := atomic.LoadInt64(&h.metrics.QueueDepth)
+			if remaining > 0 {
+				atomic.AddInt64(&h.metrics.TasksExpired, remaining)
+				atomic.StoreInt64(&h.metrics.QueueDepth, 0)
+			}
 		}
 	}
 
