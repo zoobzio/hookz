@@ -698,3 +698,223 @@ func TestServiceUncoveredPaths(t *testing.T) {
 		}
 	})
 }
+
+// TestListenerCount verifies the ListenerCount method returns correct counts
+func TestListenerCount(t *testing.T) {
+	t.Run("NoListeners", func(t *testing.T) {
+		service := New[string]()
+		defer service.Close()
+
+		// Should return 0 for events with no listeners
+		count := service.ListenerCount("nonexistent.event")
+		if count != 0 {
+			t.Errorf("Expected 0 listeners, got %d", count)
+		}
+	})
+
+	t.Run("SingleListener", func(t *testing.T) {
+		service := New[string]()
+		defer service.Close()
+
+		hook, err := service.Hook("single.event", func(ctx context.Context, data string) error {
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to register hook: %v", err)
+		}
+		defer hook.Unhook()
+
+		count := service.ListenerCount("single.event")
+		if count != 1 {
+			t.Errorf("Expected 1 listener, got %d", count)
+		}
+	})
+
+	t.Run("MultipleListeners", func(t *testing.T) {
+		service := New[string]()
+		defer service.Close()
+
+		const eventKey = "multiple.event"
+		const numHooks = 5
+		var hooks []Hook
+
+		// Register multiple listeners
+		for i := 0; i < numHooks; i++ {
+			hook, err := service.Hook(eventKey, func(ctx context.Context, data string) error {
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("Failed to register hook %d: %v", i, err)
+			}
+			hooks = append(hooks, hook)
+		}
+
+		// Verify count
+		count := service.ListenerCount(eventKey)
+		if count != numHooks {
+			t.Errorf("Expected %d listeners, got %d", numHooks, count)
+		}
+
+		// Unhook one and verify count decreases
+		if err := hooks[0].Unhook(); err != nil {
+			t.Fatalf("Failed to unhook: %v", err)
+		}
+		count = service.ListenerCount(eventKey)
+		if count != numHooks-1 {
+			t.Errorf("Expected %d listeners after unhook, got %d", numHooks-1, count)
+		}
+
+		// Cleanup remaining hooks
+		for i := 1; i < len(hooks); i++ {
+			hooks[i].Unhook()
+		}
+	})
+
+	t.Run("MultipleEvents", func(t *testing.T) {
+		service := New[int]()
+		defer service.Close()
+
+		// Register hooks for different events
+		hook1, _ := service.Hook("event1", func(ctx context.Context, data int) error { return nil })
+		hook2, _ := service.Hook("event1", func(ctx context.Context, data int) error { return nil })
+		hook3, _ := service.Hook("event2", func(ctx context.Context, data int) error { return nil })
+		defer hook1.Unhook()
+		defer hook2.Unhook()
+		defer hook3.Unhook()
+
+		// Verify counts for different events
+		if count := service.ListenerCount("event1"); count != 2 {
+			t.Errorf("Expected 2 listeners for event1, got %d", count)
+		}
+		if count := service.ListenerCount("event2"); count != 1 {
+			t.Errorf("Expected 1 listener for event2, got %d", count)
+		}
+		if count := service.ListenerCount("event3"); count != 0 {
+			t.Errorf("Expected 0 listeners for event3, got %d", count)
+		}
+	})
+
+	t.Run("ConcurrentAccess", func(t *testing.T) {
+		service := New[string]()
+		defer service.Close()
+
+		const eventKey = "concurrent.event"
+		var wg sync.WaitGroup
+		var hooks []Hook
+		var mu sync.Mutex
+
+		// Concurrently register hooks
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				hook, err := service.Hook(eventKey, func(ctx context.Context, data string) error {
+					return nil
+				})
+				if err == nil {
+					mu.Lock()
+					hooks = append(hooks, hook)
+					mu.Unlock()
+				}
+			}()
+		}
+
+		// Concurrently check count while registering
+		for i := 0; i < 5; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				// Just verify it doesn't panic
+				_ = service.ListenerCount(eventKey)
+			}()
+		}
+
+		wg.Wait()
+
+		// Final count should match registered hooks
+		finalCount := service.ListenerCount(eventKey)
+		if finalCount != len(hooks) {
+			t.Errorf("Expected %d listeners, got %d", len(hooks), finalCount)
+		}
+
+		// Cleanup
+		for _, hook := range hooks {
+			hook.Unhook()
+		}
+	})
+
+	t.Run("AfterClear", func(t *testing.T) {
+		service := New[string]()
+		defer service.Close()
+
+		const eventKey = "clear.event"
+
+		// Register multiple hooks
+		for i := 0; i < 3; i++ {
+			_, err := service.Hook(eventKey, func(ctx context.Context, data string) error {
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("Failed to register hook: %v", err)
+			}
+		}
+
+		// Verify initial count
+		if count := service.ListenerCount(eventKey); count != 3 {
+			t.Errorf("Expected 3 listeners before clear, got %d", count)
+		}
+
+		// Clear the event
+		service.Clear(eventKey)
+
+		// Count should be 0 after clear
+		if count := service.ListenerCount(eventKey); count != 0 {
+			t.Errorf("Expected 0 listeners after clear, got %d", count)
+		}
+	})
+
+	t.Run("OptimizationUseCase", func(t *testing.T) {
+		// This test demonstrates the intended use case for ListenerCount:
+		// Avoiding allocations when no listeners are present
+		service := New[[]byte]()
+		defer service.Close()
+
+		const eventKey = "optimization.event"
+
+		// Simulate downstream package checking before allocation
+		createPayload := func() []byte {
+			// Only create expensive payload if there are listeners
+			if service.ListenerCount(eventKey) == 0 {
+				return nil
+			}
+			// Expensive allocation
+			return make([]byte, 1024*1024) // 1MB
+		}
+
+		// No listeners, should not allocate
+		payload := createPayload()
+		if payload != nil {
+			t.Error("Expected nil payload when no listeners")
+		}
+
+		// Add listener
+		hook, _ := service.Hook(eventKey, func(ctx context.Context, data []byte) error {
+			return nil
+		})
+
+		// With listener, should allocate
+		payload = createPayload()
+		if payload == nil {
+			t.Error("Expected payload when listener exists")
+		}
+
+		// Remove listener
+		hook.Unhook()
+
+		// No listeners again, should not allocate
+		payload = createPayload()
+		if payload != nil {
+			t.Error("Expected nil payload after unhooking")
+		}
+	})
+}

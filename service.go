@@ -324,6 +324,18 @@ func (h *Hooks[T]) ClearAll() int {
 	return count
 }
 
+// ListenerCount returns the number of active listeners (hooks) registered for the given event.
+// This allows downstream packages to optimize allocations by checking if there are any listeners
+// before creating data structures that would be passed to Emit.
+//
+// Returns 0 if no listeners are registered for the event.
+func (h *Hooks[T]) ListenerCount(event Key) int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	return len(h.hooks[event])
+}
+
 // Emit executes all hooks for the event using the provided context.
 func (h *Hooks[T]) Emit(ctx context.Context, event Key, data T) error {
 	// Get hooks under read lock to minimize lock contention
