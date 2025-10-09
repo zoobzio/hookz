@@ -363,11 +363,9 @@ func (h *Hooks[T]) Emit(ctx context.Context, event Key, data T) error {
 		return nil
 	}
 
-	// No worker pool means no hooks have been registered yet
-	// This shouldn't happen if hooks exist, but handle gracefully
-	if workers == nil {
-		return nil
-	}
+	// Invariant: workers is non-nil when hooks exist
+	// Worker pool is initialized in Hook() before any hooks are added,
+	// so if len(hooks) > 0, workers must be non-nil
 
 	// Submit hook tasks to worker pool
 	for _, hook := range hooks {

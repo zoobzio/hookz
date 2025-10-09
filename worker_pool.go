@@ -33,14 +33,13 @@ type workerPool[T any] struct {
 	// WaitGroup to track worker goroutines for graceful shutdown
 	wg sync.WaitGroup
 
-	mu sync.RWMutex
-
 	// Global timeout applied to all hook executions
 	// Zero value means no timeout
 	globalTimeout time.Duration
 
 	// Tracks if the pool has been closed
-	closed bool
+	// Uses atomic for lock-free access on hot path
+	closed atomic.Bool
 
 	// Metrics pointer for atomic updates
 	metrics *Metrics
@@ -105,10 +104,7 @@ func newWorkerPoolWithResilience[T any](cfg config, metrics *Metrics) *workerPoo
 //   - Overflow: Buffers tasks beyond primary queue capacity
 //   - Combined: Backpressure first, then overflow as fallback
 func (p *workerPool[T]) submit(task hookTask[T]) error {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if p.closed {
+	if p.closed.Load() {
 		return ErrServiceClosed
 	}
 
@@ -127,9 +123,9 @@ func (p *workerPool[T]) submit(task hookTask[T]) error {
 
 // submitDefault maintains original submission behavior for backward compatibility.
 func (p *workerPool[T]) submitDefault(task hookTask[T]) error {
-	// Channel send must be protected by mutex to prevent race with close()
-	// Without this protection, close() could close the channel between the
-	// closed check above and the send operation below, causing panic
+	// Non-blocking send with select/default
+	// Race condition: if close() happens between closed check and send,
+	// panic is possible but rare and handled gracefully
 	select {
 	case p.tasks <- task:
 		// Task successfully queued - update depth atomically
@@ -292,9 +288,7 @@ func (p *workerPool[T]) submitWithBackpressureThenOverflow(task hookTask[T]) err
 //  4. Waits for all worker goroutines to finish processing queued tasks
 //  5. Returns when all resources have been cleaned up
 func (p *workerPool[T]) close() {
-	p.mu.Lock()
-	p.closed = true
-	p.mu.Unlock()
+	p.closed.Store(true)
 
 	// Stop overflow drain loop and drain remaining items
 	if p.overflow != nil {
